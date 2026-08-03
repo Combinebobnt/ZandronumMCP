@@ -32,6 +32,7 @@ export class FakeBridge {
   private readonly sockets: net.Socket[] = [];
   private readonly handlers: Array<{ match: string; lines: string[] }> = [];
   private readonly rawHandlers: Array<{ match: string; messages: Record<string, unknown>[] }> = [];
+  private readonly swallowed: string[] = [];
   /** Every message the client sent — lets tests assert fire-and-forget sends. */
   readonly received: Array<{ t?: string; text?: string }> = [];
   private readonly swallowCommands: boolean;
@@ -67,10 +68,24 @@ export class FakeBridge {
     return this;
   }
 
+  /** Accept commands containing `match` but never reply — a deterministic
+   *  per-command timeout, without swallowing every other command too. */
+  swallow(match: string): this {
+    this.swallowed.push(match);
+    return this;
+  }
+
   /** Reply with arbitrary (possibly partial) out messages — e.g. missing text/level. */
   respondToRaw(match: string, messages: Record<string, unknown>[]): this {
     this.rawHandlers.push({ match, messages });
     return this;
+  }
+
+  /** Push console output nobody asked for — the engine chatters continuously. */
+  push(text: string): void {
+    for (const s of this.sockets) {
+      s.write(encodeMessage({ v: PROTOCOL_VERSION, t: "out", text, level: 0 }));
+    }
   }
 
   /** Gracefully FIN every open connection (client sees a clean close). */
@@ -127,6 +142,7 @@ export class FakeBridge {
     const echoMatch = text.match(/^(.*?)\s*;\s*echo\s+(\S+)\s*$/);
     const command = (echoMatch ? echoMatch[1] : text).trim();
     const sentinel = echoMatch ? echoMatch[2] : null;
+    if (this.swallowed.some((m) => command.includes(m))) return;
 
     const raw = this.rawHandlers.find((h) => command.includes(h.match));
     if (raw) {

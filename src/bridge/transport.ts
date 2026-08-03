@@ -23,14 +23,21 @@ interface PendingCommand {
 /**
  * Talks to one bridge-patched Zandronum instance over loopback TCP.
  *
- * NOTE: console output is a single shared stream, so commands are correlated by
- * a unique echo sentinel and MUST be issued serially per instance. Callers
- * should await each runCommand before sending the next.
+ * NOTE: console output is a single shared stream with no per-command framing —
+ * correlation is by unique echo sentinel, which only works if exactly one
+ * command is in flight at a time. Overlapping commands would let an earlier
+ * command's output land in a later one's buffer (the later sentinel arrives
+ * last, so it collects everything before it). MCP clients happily issue tool
+ * calls in parallel, so `runCommand` serialises them here rather than trusting
+ * callers to await in order.
  */
 export class BridgeClient extends EventEmitter {
   private socket?: net.Socket;
   private readonly decoder = new NdjsonDecoder();
-  private pending: PendingCommand[] = [];
+  /** The one command currently on the wire, if any. */
+  private pending?: PendingCommand;
+  /** Tail of the serialisation chain; the next command starts when it settles. */
+  private queue: Promise<unknown> = Promise.resolve();
   private capsSet = new Set<string>();
   private seq = 0;
   private readonly host: string;
@@ -96,7 +103,7 @@ export class BridgeClient extends EventEmitter {
       });
 
       socket.on("close", () => {
-        this.failAllPending(new Error("Bridge connection closed"));
+        this.failPending(new Error("Bridge connection closed"));
         this.emit("close");
       });
       // A post-connect socket error (e.g. the game process exiting) is always
@@ -113,24 +120,37 @@ export class BridgeClient extends EventEmitter {
     const text = out.text ?? "";
     const level = typeof out.level === "number" ? out.level : 0;
     this.emit("output", text, level);
-    for (const cmd of this.pending) {
-      cmd.lines.push(text);
-    }
-    this.checkPending();
-  }
-
-  private checkPending(): void {
-    for (const cmd of [...this.pending]) {
-      const result = collectUntilSentinel(cmd.lines, cmd.sentinel);
-      if (result.complete) {
-        clearTimeout(cmd.timer);
-        this.pending = this.pending.filter((c) => c !== cmd);
-        cmd.resolve(result.output);
-      }
+    const cmd = this.pending;
+    if (!cmd) return;
+    cmd.lines.push(text);
+    const result = collectUntilSentinel(cmd.lines, cmd.sentinel);
+    if (result.complete) {
+      clearTimeout(cmd.timer);
+      this.pending = undefined;
+      cmd.resolve(result.output);
     }
   }
 
+  /**
+   * Run a console command and resolve with the output it produced.
+   *
+   * Queued behind any command already in flight on this client, so overlapping
+   * callers (parallel MCP tool calls) can't cross-contaminate each other's
+   * output. The timeout covers the command's own run, not its wait in the queue.
+   */
   runCommand(text: string, timeoutMs?: number): Promise<string[]> {
+    const exec = () => this.execCommand(text, timeoutMs);
+    // Run next regardless of how the previous one settled, and swallow on the
+    // chain copy only — the returned promise still carries the rejection.
+    const result = this.queue.then(exec, exec);
+    this.queue = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
+  private execCommand(text: string, timeoutMs?: number): Promise<string[]> {
     const socket = this.socket;
     if (!socket) return Promise.reject(new Error("Not connected"));
     const id = (++this.seq).toString(36);
@@ -138,10 +158,11 @@ export class BridgeClient extends EventEmitter {
     const effectiveTimeout = timeoutMs ?? this.commandTimeoutMs;
     return new Promise<string[]>((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.pending = this.pending.filter((c) => c.sentinel !== sentinel);
+        // Serialised, so whatever is pending at this point is this command.
+        this.pending = undefined;
         reject(new Error(`Command timed out after ${effectiveTimeout}ms: ${text}`));
       }, effectiveTimeout);
-      this.pending.push({ sentinel, lines: [], resolve, reject, timer });
+      this.pending = { sentinel, lines: [], resolve, reject, timer };
       socket.write(
         encodeMessage({ v: PROTOCOL_VERSION, t: "cmd", text: withSentinel(text, sentinel) }),
       );
@@ -183,12 +204,12 @@ export class BridgeClient extends EventEmitter {
     socket.write(encodeMessage({ v: PROTOCOL_VERSION, t: "cmd", text }));
   }
 
-  private failAllPending(err: Error): void {
-    for (const cmd of this.pending) {
-      clearTimeout(cmd.timer);
-      cmd.reject(err);
-    }
-    this.pending = [];
+  private failPending(err: Error): void {
+    const cmd = this.pending;
+    if (!cmd) return;
+    clearTimeout(cmd.timer);
+    this.pending = undefined;
+    cmd.reject(err);
   }
 
   close(): void {

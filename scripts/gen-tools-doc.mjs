@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 //
-// gen-tools-doc.mjs -- auto-generate README.tools.md from src/server.ts.
+// gen-tools-doc.mjs -- auto-generate README.tools.md from src/tools.ts.
 //
 // Parses the real source with the TypeScript compiler API (already a
 // devDependency), so it never runs the MCP server and never drifts from the
 // code. Tools are grouped by the `// --- section ---` header comments in
-// server.ts, in source order. Run: `npm run docs:tools`.
+// tools.ts, in source order. Run: `npm run docs:tools`.
 //
 import ts from "typescript";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
@@ -13,7 +13,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const serverPath = join(root, "src", "server.ts");
+const serverPath = join(root, "src", "tools.ts");
 const outPath = join(root, "README.tools.md");
 const source = readFileSync(serverPath, "utf8");
 
@@ -24,7 +24,8 @@ const lineOf = (pos) => sf.getLineAndCharacterOfPosition(pos).line;
 //    non-tool "configuration" block at the top).
 const sections = [];
 source.split("\n").forEach((text, i) => {
-  const m = text.match(/^\/\/ ---+\s*(.*?)\s*-*\s*$/);
+  // Leading whitespace allowed: the tool definitions live inside registerTools().
+  const m = text.match(/^\s*\/\/ ---+\s*(.*?)\s*-*\s*$/);
   if (m && !/^configuration/i.test(m[1])) {
     sections.push({ line: i, label: m[1].replace(/\s*\(.*\)\s*$/, "").trim() });
   }
@@ -96,7 +97,7 @@ const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 
 let md = `# Tools
 
-> **Auto-generated** from \`src/server.ts\` by \`scripts/gen-tools-doc.mjs\` — do not
+> **Auto-generated** from \`src/tools.ts\` by \`scripts/gen-tools-doc.mjs\` — do not
 > edit by hand; run \`npm run docs:tools\` to regenerate.
 
 The MCP server exposes **${tools.length} tools**. Your agent also discovers them at

@@ -132,6 +132,17 @@ export class InstanceRegistry {
     return this.clients.has(id);
   }
 
+  /** Drop an instance's connection without touching its process. For letting go
+   *  of a bridge that turned out not to be the engine we meant to talk to —
+   *  killing it would be killing someone else's process. */
+  detach(id: number): void {
+    const client = this.clients.get(id);
+    if (client) {
+      client.close();
+      this.clients.delete(id);
+    }
+  }
+
   /** Stop a launched instance's process (if any) and detach its client. */
   kill(id: number): void {
     const child = this.children.get(id);

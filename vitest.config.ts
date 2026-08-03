@@ -10,7 +10,10 @@ export default defineConfig({
       // honest measure of our own code.
       include: ["src/**", "engine-bridge/apply-bridge.core.mjs"],
       exclude: [
-        "src/server.ts", // MCP wiring — exercised by the e2e smoke, not unit-covered
+        // The CLI shell only: env -> config, stdio transport, signal handlers.
+        // Everything it wires up (context.ts, tools.ts) IS covered below, driven
+        // through a real MCP client/server pair in test/tools.test.ts.
+        "src/server.ts",
         "src/**/*.d.ts",
         // apply-bridge.mjs is the thin CLI shell (argv -> applyBridge); its logic
         // lives in apply-bridge.core.mjs, which IS unit-covered below.
@@ -18,8 +21,7 @@ export default defineConfig({
       ],
       reporter: ["text", "html"],
       // 100% across the board for our own code. The bar is intentionally
-      // strict — see AGENTS.md. server.ts (MCP wiring) is the only exclusion
-      // and is covered by the e2e smoke instead.
+      // strict — see AGENTS.md. The CLI entrypoint is the only exclusion.
       thresholds: {
         lines: 100,
         functions: 100,

@@ -58,6 +58,55 @@ describe("BridgeClient <-> FakeBridge", () => {
     expect(await client.runCommand("mapname")).toEqual(["MAP01"]);
   });
 
+  it("emits unsolicited console output without attributing it to a command", async () => {
+    bridge = await FakeBridge.start();
+    bridge.respondTo("mapname", ["MAP01"]);
+    client = new BridgeClient({ port: bridge.port });
+    await client.connect();
+
+    // The engine prints constantly, including while no command is in flight.
+    const seen = new Promise<string>((resolve) => client!.once("output", resolve));
+    bridge.push("Player entered the game");
+    expect(await seen).toBe("Player entered the game");
+
+    // That chatter must not end up in the next command's output.
+    expect(await client.runCommand("mapname")).toEqual(["MAP01"]);
+  });
+
+  it("serialises overlapping commands so their output can't cross-contaminate", async () => {
+    bridge = await FakeBridge.start();
+    bridge.respondTo("version", ["Zandronum 3.2.1"]).respondTo("mapname", ["MAP01"]);
+    client = new BridgeClient({ port: bridge.port });
+    await client.connect();
+
+    // Fired together, as parallel MCP tool calls would. Unserialised, the second
+    // command's buffer would also collect the first's output and sentinel.
+    const [first, second] = await Promise.all([
+      client.runCommand("version"),
+      client.runCommand("mapname"),
+    ]);
+    expect(first).toEqual(["Zandronum 3.2.1"]);
+    expect(second).toEqual(["MAP01"]);
+
+    // The second command must not even reach the wire until the first is done.
+    const sent = bridge.received.filter((m) => m.t === "cmd").map((m) => m.text ?? "");
+    expect(sent).toHaveLength(2);
+    expect(sent[0]).toMatch(/^version /);
+    expect(sent[1]).toMatch(/^mapname /);
+  });
+
+  it("runs a queued command after the one ahead of it fails", async () => {
+    bridge = await FakeBridge.start();
+    bridge.swallow("hang").respondTo("mapname", ["MAP01"]);
+    client = new BridgeClient({ port: bridge.port, commandTimeoutMs: 100 });
+    await client.connect();
+
+    const failing = client.runCommand("hang");
+    const queued = client.runCommand("mapname");
+    await expect(failing).rejects.toThrow(/timed out/);
+    expect(await queued).toEqual(["MAP01"]);
+  });
+
   it("times out cleanly if the engine never echoes the sentinel", async () => {
     bridge = await FakeBridge.start({ swallowCommands: true });
     client = new BridgeClient({ port: bridge.port, commandTimeoutMs: 100 });
