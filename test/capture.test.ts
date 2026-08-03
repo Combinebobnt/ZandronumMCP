@@ -22,7 +22,9 @@ afterEach(() => {
 
 describe("screenshotName", () => {
   it("formats a sequence into a name", () => {
-    expect(screenshotName(3)).toBe("mcp_shot_3");
+    expect(screenshotName(3, 4242)).toBe("mcp_shot_4242_3");
+    // Defaults to this process, so two servers can't collide on one filename.
+    expect(screenshotName(3)).toBe(`mcp_shot_${process.pid}_3`);
   });
 });
 
@@ -39,7 +41,7 @@ describe("captureScreenshot", () => {
       },
     };
     const shot = await captureScreenshot(stubClient, { dir: "/anywhere" }, io);
-    expect(shot.name).toMatch(/^mcp_shot_\d+$/);
+    expect(shot.name).toMatch(/^mcp_shot_\d+_\d+$/);
     expect(shot.base64).toBe(Buffer.from("PNGDATA").toString("base64"));
     expect(unlinked).toEqual([shot.path]);
   });

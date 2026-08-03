@@ -1216,6 +1216,41 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
   );
 
   server.registerTool(
+    "attach_instance",
+    {
+      title: "Attach to an engine you started yourself",
+      description:
+        "Connect to a bridge-patched Zandronum that is ALREADY running — one you launched by hand, or from a terminal — and bind it to an instance number for the other tools. Only needed for engines this session didn't launch: launch_instance binds automatically. Defaults to this instance's conventional port.",
+      inputSchema: { instance: instanceArg, port: z.number().int().positive().optional() },
+    },
+    async ({ instance, port }) => {
+      const target = port ?? ctx.portFor(instance);
+      ctx.bind(instance, target);
+      try {
+        const client = await ctx.clientFor(instance);
+        ctx.rememberEngine(instance, client.enginePid);
+        const pid = client.enginePid !== undefined ? ` (engine PID ${client.enginePid})` : "";
+        return {
+          content: [{ type: "text", text: `attached instance ${instance} to port ${target}${pid}` }],
+        };
+      } catch (e) {
+        // Don't leave a binding pointing at something we couldn't reach.
+        ctx.forgetInstance(instance);
+        const msg = e instanceof Error ? e.message : String(e);
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: `Could not attach instance ${instance} to port ${target}: ${msg}. Is a bridge-patched engine listening there?`,
+            },
+          ],
+        };
+      }
+    },
+  );
+
+  server.registerTool(
     "kill_instance",
     {
       title: "Kill a Zandronum instance",
@@ -1242,12 +1277,17 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
   server.registerTool(
     "reset",
     {
-      title: "Reset — reap all engine instances",
+      title: "Reset — reap this session's engine instances",
       description:
-        "Kill every instance this session launched AND best-effort reap orphaned engine processes left by earlier sessions (that could otherwise squat bridge ports). Use this to recover from stale instances / port collisions before relaunching.",
-      inputSchema: {},
+        "Kill every instance this session launched, and reap engines ORPHANED by earlier sessions (whose launcher is gone) that could otherwise squat bridge ports. Engines belonging to another running editor window are left alone. Pass all:true to also kill those — only do that if you know no other session is using this engine build.",
+      inputSchema: {
+        all: z
+          .boolean()
+          .default(false)
+          .describe("Also kill engines owned by other live MCP sessions using this same build."),
+      },
     },
-    async () => {
+    async ({ all }) => {
       ctx.registry.closeAll();
       ctx.forgetAll();
       if (!ctx.config.exe) {
@@ -1257,8 +1297,11 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
           ],
         };
       }
-      const r = await ctx.io.reap(ctx.config.exe);
-      const lines = [`Reset complete. Reaped ${r.killed.length} orphaned engine process(es).`];
+      // Orphans-only by default: a process whose parent is still alive belongs to
+      // somebody else's session, and killing it would take down their game.
+      const r = await ctx.io.reap(ctx.config.exe, { onlyOrphans: !all });
+      const scope = all ? "engine process(es)" : "orphaned engine process(es)";
+      const lines = [`Reset complete. Reaped ${r.killed.length} ${scope}.`];
       if (r.survivors.length) {
         lines.push(
           `${r.survivors.length} process(es) survived SIGKILL (PIDs ${r.survivors.join(", ")}) — ` +

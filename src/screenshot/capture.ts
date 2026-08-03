@@ -36,8 +36,15 @@ const defaultIo: CaptureIo = {
 
 let counter = 0;
 
-export function screenshotName(seq: number): string {
-  return `mcp_shot_${seq}`;
+/**
+ * Screenshot basename, namespaced by the MCP server's PID.
+ *
+ * The counter restarts at 1 in every server process and capture DELETES the
+ * file once it has read it, so two sessions sharing one engine directory would
+ * otherwise race on `mcp_shot_1.png` and eat each other's frames.
+ */
+export function screenshotName(seq: number, pid: number = process.pid): string {
+  return `mcp_shot_${pid}_${seq}`;
 }
 
 /**

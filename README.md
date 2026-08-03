@@ -29,7 +29,6 @@ Let an AI assistant supercharge Zandronum development from your editor: Write C+
          "command": "npx",
          "args": ["-y", "zandronum-mcp"],
          "env": {
-           "ZANDRONUM_BRIDGE_PORT": "7777",
            "ZANDRONUM_EXE": "C:/path/to/zandronum-mcp-hooks.exe"
          }
        }
@@ -38,6 +37,13 @@ Let an AI assistant supercharge Zandronum development from your editor: Write C+
    ```
 
    Point `ZANDRONUM_EXE` at the `zandronum-mcp-hooks.exe` or `zandronum-mcp-hooks.app` you just unzipped, then restart your chat session.
+
+   > **Working on several checkouts at once?** You don't need to do anything. The
+   > bridge port is derived from the engine path, so each build gets its own port
+   > range, each launched engine gets its own `-config` instead of sharing the
+   > one system-wide `zandronum.ini`, and instance numbers are scoped to your
+   > session — one editor window can never drive another's game. Set
+   > `ZANDRONUM_BRIDGE_PORT` only if you want to pin a specific port.
 
 4. Verify with your preferred AI Agent by asking it, "Is Zandronum MCP loaded?" if it responds positively, then it is wired up.
 

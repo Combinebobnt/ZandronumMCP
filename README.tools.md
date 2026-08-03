@@ -3,7 +3,7 @@
 > **Auto-generated** from `src/tools.ts` by `scripts/gen-tools-doc.mjs` — do not
 > edit by hand; run `npm run docs:tools` to regenerate.
 
-The MCP server exposes **51 tools**. Your agent also discovers them at
+The MCP server exposes **52 tools**. Your agent also discovers them at
 runtime via each tool's `description`, so this is mainly for browsing.
 
 ## Commands, cheats & input
@@ -85,7 +85,8 @@ runtime via each tool's `description`, so this is mainly for browsing.
 ## Process management
 
 - **`launch_instance`** — Spawn a bridge-enabled Zandronum process with the given options and attach to it. Requires ZANDRONUM_EXE to be set.
+- **`attach_instance`** — Connect to a bridge-patched Zandronum that is ALREADY running — one you launched by hand, or from a terminal — and bind it to an instance number for the other tools. Only needed for engines this session didn't launch: launch_instance binds automatically. Defaults to this instance's conventional port.
 - **`kill_instance`** — Stop a launched instance and detach from it. Asks the engine to quit itself first (a hard kill mid-render can wedge macOS GPU teardown and leave an unkillable process), then force-kills if it doesn't exit.
-- **`reset`** — Kill every instance this session launched AND best-effort reap orphaned engine processes left by earlier sessions (that could otherwise squat bridge ports). Use this to recover from stale instances / port collisions before relaunching.
+- **`reset`** — Kill every instance this session launched, and reap engines ORPHANED by earlier sessions (whose launcher is gone) that could otherwise squat bridge ports. Engines belonging to another running editor window are left alone. Pass all:true to also kill those — only do that if you know no other session is using this engine build.
 - **`get_startup_errors`** — Read the engine's captured console log for an instance and surface DECORATE/ACS compile errors and fatal startup errors. Works even when the bridge never came up (e.g. the engine aborted on a bad script) — exactly when the other tools can't connect.
 - **`get_crash`** — Return the signal, faulting address, and symbolized backtrace the bridge's crash handler captured the last time the engine crashed (segfault/abort/bus error/etc.). Use this when an instance dies unexpectedly — e.g. run_command reports the bridge closed. Empty if the instance has not crashed.

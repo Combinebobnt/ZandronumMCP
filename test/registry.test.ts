@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { describe, it, expect, afterEach } from "vitest";
 import net from "node:net";
 import { FakeBridge } from "./fakes/fake-bridge.js";
@@ -71,7 +72,17 @@ describe("InstanceRegistry", () => {
       io,
     );
     expect(spawned[0].exe).toBe("zandronum.exe");
-    expect(spawned[0].args).toEqual(["-iwad", "freedoom2.wad", "+set", "fullscreen", "0"]);
+    // Each build gets its own -config, so branches can't trade cvars through
+    // the single user-level zandronum.ini they would otherwise share.
+    expect(spawned[0].args).toEqual([
+      "-config",
+      join("zandronum-mcp.ini"),
+      "-iwad",
+      "freedoom2.wad",
+      "+set",
+      "fullscreen",
+      "0",
+    ]);
     expect(spawned[0].env.ZANDRONUM_BRIDGE_PORT).toBe(String(bridge.port));
     expect(spawned[0].env.ZANDRONUM_BRIDGE_LOG).toBe("C:/tmp/inst1.log");
     expect(dequarantined).toEqual(["zandronum.exe"]);

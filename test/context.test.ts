@@ -70,6 +70,7 @@ describe("ServerContext.clientFor", () => {
   it("attaches once and reuses the connection", async () => {
     bridge = await FakeBridge.start();
     const ctx = makeCtx({ basePort: bridge.port });
+    ctx.bind(1, bridge.port);
     const first = await ctx.clientFor(1);
     const second = await ctx.clientFor(1);
     expect(second).toBe(first);
@@ -79,6 +80,7 @@ describe("ServerContext.clientFor", () => {
   it("shares one attach between concurrent callers instead of leaking sockets", async () => {
     bridge = await FakeBridge.start();
     const ctx = makeCtx({ basePort: bridge.port });
+    ctx.bind(1, bridge.port);
     // Parallel tool calls: without in-flight de-duplication each would open its
     // own socket and all but the last would be orphaned in the registry.
     const [a, b, c] = await Promise.all([ctx.clientFor(1), ctx.clientFor(1), ctx.clientFor(1)]);
@@ -92,6 +94,7 @@ describe("ServerContext.clientFor", () => {
     const ctx = makeCtx({ basePort: bridge.port });
     // The instance was launched as PID 1234; the bridge now answering its port
     // belongs to something else, so driving it would drive the wrong game.
+    ctx.bind(1, bridge.port);
     ctx.rememberEngine(1, 1234);
     await expect(ctx.clientFor(1)).rejects.toThrow(/is PID 4321, not the engine launched/);
     // The mismatched connection is dropped, never killed — it isn't ours.
@@ -101,6 +104,7 @@ describe("ServerContext.clientFor", () => {
   it("accepts a re-attach to the same process", async () => {
     bridge = await FakeBridge.start({ hello: { v: 1, t: "hello", engine: "fake", pid: 1234 } });
     const ctx = makeCtx({ basePort: bridge.port });
+    ctx.bind(1, bridge.port);
     ctx.rememberEngine(1, 1234);
     await expect(ctx.clientFor(1)).resolves.toBeDefined();
     ctx.registry.closeAll();
@@ -109,11 +113,13 @@ describe("ServerContext.clientFor", () => {
   it("skips the identity check when either side has no PID to compare", async () => {
     bridge = await FakeBridge.start({ hello: { v: 1, t: "hello", engine: "fake" } });
     const ctx = makeCtx({ basePort: bridge.port });
+    ctx.bind(1, bridge.port);
     ctx.rememberEngine(1, 1234); // older bridge reports no pid — stay compatible
     await expect(ctx.clientFor(1)).resolves.toBeDefined();
     ctx.registry.closeAll();
 
     const other = makeCtx({ basePort: bridge.port });
+    other.bind(1, bridge.port);
     other.rememberEngine(1, undefined); // nothing to remember, nothing to enforce
     await expect(other.clientFor(1)).resolves.toBeDefined();
     other.registry.closeAll();
@@ -122,14 +128,18 @@ describe("ServerContext.clientFor", () => {
   it("forgets a remembered engine along with the rest of the instance", async () => {
     bridge = await FakeBridge.start({ hello: { v: 1, t: "hello", engine: "fake", pid: 4321 } });
     const ctx = makeCtx({ basePort: bridge.port });
+    ctx.bind(1, bridge.port);
     ctx.rememberEngine(1, 1234);
     ctx.forgetInstance(1);
+    ctx.bind(1, bridge.port); // forget drops the binding too; re-claim to retry
     await expect(ctx.clientFor(1)).resolves.toBeDefined();
     ctx.registry.closeAll();
 
     const other = makeCtx({ basePort: bridge.port });
+    other.bind(1, bridge.port);
     other.rememberEngine(1, 1234);
     other.forgetAll();
+    other.bind(1, bridge.port);
     await expect(other.clientFor(1)).resolves.toBeDefined();
     other.registry.closeAll();
   });
@@ -141,6 +151,7 @@ describe("ServerContext.clientFor", () => {
     bridge = undefined;
 
     const ctx = makeCtx({ basePort: deadPort });
+    ctx.bind(1, deadPort);
     await expect(Promise.all([ctx.clientFor(1), ctx.clientFor(1)])).rejects.toThrow();
     // A second round must attempt a fresh attach rather than reuse the failure.
     await expect(ctx.clientFor(1)).rejects.toThrow();

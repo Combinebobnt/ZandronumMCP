@@ -1,6 +1,7 @@
 import net from "node:net";
 import { dirname, join } from "node:path";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 
 /**
  * Accept `ZANDRONUM_EXE` pointing at either the macOS `.app` bundle or the binary
@@ -99,6 +100,50 @@ export function buildLaunchEnv(
   return env;
 }
 
+/**
+ * How far apart two engine builds' port ranges sit. Wider than findFreePort's
+ * search span, so one build's instances can never wander into another's range.
+ */
+export const PORT_STRIDE = 20;
+/** Number of distinct derived ranges before they wrap and can collide. */
+const PORT_BUCKETS = 64;
+export const DEFAULT_BASE_PORT = 7777;
+
+/**
+ * The bridge port an engine's instance 1 listens on.
+ *
+ * An explicit ZANDRONUM_BRIDGE_PORT always wins. Otherwise it is derived from
+ * the engine's path, so several checkouts of the same project — each with its
+ * own build, each driven by its own editor session — land in different port
+ * ranges without anyone configuring anything. Sessions sharing one build still
+ * share a range; that is what the per-instance free-port scan and the refusal to
+ * attach to an unbound port are for.
+ */
+export function deriveBasePort(exe: string | undefined, envPort: string | undefined): number {
+  if (envPort !== undefined) {
+    const explicit = Number.parseInt(envPort, 10);
+    if (Number.isInteger(explicit) && explicit > 0) return explicit;
+  }
+  if (!exe) return DEFAULT_BASE_PORT;
+  // First 4 bytes of the digest is plenty of spread for 64 buckets.
+  const digest = createHash("sha1").update(exe).digest();
+  return DEFAULT_BASE_PORT + (digest.readUInt32BE(0) % PORT_BUCKETS) * PORT_STRIDE;
+}
+
+/**
+ * Where a launched engine keeps its own config, so agent-driven runs can't
+ * scribble on the user's real settings — or on another checkout's.
+ *
+ * Zandronum stores its ini under the user's preferences directory, NOT next to
+ * the binary, so every build on the machine reads and writes the SAME file.
+ * Two branches under test then trade cvars through it: whichever engine exits
+ * last wins, and the next launch of any other build inherits the result. Giving
+ * each build its own `-config` breaks that channel.
+ */
+export function configPathFor(exe: string): string {
+  return join(dirname(exe), "zandronum-mcp.ini");
+}
+
 /** Game options that map to Zandronum command-line arguments. */
 export interface LaunchOptions {
   iwad?: string;
@@ -109,11 +154,15 @@ export interface LaunchOptions {
   width?: number;
   height?: number;
   extraArgs?: string[];
+  /** Engine config file (-config). See configPathFor. */
+  config?: string;
 }
 
 /** Build the argv for launching Zandronum from structured options. */
 export function buildLaunchArgs(o: LaunchOptions): string[] {
   const args: string[] = [];
+  // Before anything else: the config decides defaults the rest may override.
+  if (o.config) args.push("-config", o.config);
   if (o.iwad) args.push("-iwad", o.iwad);
   if (o.files?.length) args.push("-file", ...o.files);
   if (o.skill !== undefined) args.push("-skill", String(o.skill));

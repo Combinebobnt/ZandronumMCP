@@ -1,6 +1,20 @@
+import { join } from "node:path";
 import { describe, it, expect } from "vitest";
 import net from "node:net";
-import { buildLaunchArgs, buildLaunchEnv, clearQuarantine, resolveEngineExe, resolveScreenshotDir, waitForPort, tryConnect, findFreePort } from "../src/process/launch.js";
+import {
+  buildLaunchArgs,
+  buildLaunchEnv,
+  clearQuarantine,
+  resolveEngineExe,
+  resolveScreenshotDir,
+  waitForPort,
+  tryConnect,
+  findFreePort,
+  deriveBasePort,
+  configPathFor,
+  DEFAULT_BASE_PORT,
+  PORT_STRIDE,
+} from "../src/process/launch.js";
 
 describe("resolveEngineExe", () => {
   it("resolves a macOS .app bundle to its inner executable", () => {
@@ -188,5 +202,69 @@ describe("waitForPort", () => {
     await waitForPort("127.0.0.1", port, 30, 25);
     expect(await tryConnect("127.0.0.1", port)).toBe(true);
     await new Promise<void>((r) => server.close(() => r()));
+  });
+});
+
+describe("deriveBasePort", () => {
+  it("honours an explicit port", () => {
+    expect(deriveBasePort("/repos/a/build/zandronum", "9000")).toBe(9000);
+  });
+
+  it("ignores a junk or non-positive explicit port", () => {
+    expect(deriveBasePort(undefined, "nonsense")).toBe(DEFAULT_BASE_PORT);
+    expect(deriveBasePort(undefined, "0")).toBe(DEFAULT_BASE_PORT);
+  });
+
+  it("falls back to the default with no engine and no setting", () => {
+    expect(deriveBasePort(undefined, undefined)).toBe(DEFAULT_BASE_PORT);
+  });
+
+  it("is stable for a given engine path", () => {
+    const exe = "/repos/ZandroX-chat2/build/zandronum";
+    expect(deriveBasePort(exe, undefined)).toBe(deriveBasePort(exe, undefined));
+  });
+
+  it("separates sibling checkouts into different ranges", () => {
+    // The real motivating case: four branches of one project, four builds, four
+    // editor windows that would otherwise all claim 7777.
+    const bases = ["", "-chat2", "-chat3", "-chat4"].map((suffix) =>
+      deriveBasePort(`/Users/x/repos/ZandroX${suffix}/build/zandronum`, undefined),
+    );
+    expect(new Set(bases).size).toBe(4);
+    // Far enough apart that findFreePort's search can't cross into a neighbour.
+    for (const a of bases) {
+      for (const b of bases) {
+        if (a !== b) expect(Math.abs(a - b)).toBeGreaterThanOrEqual(PORT_STRIDE);
+      }
+    }
+  });
+
+  it("lands on a sane port range", () => {
+    const port = deriveBasePort("/some/engine", undefined);
+    expect(port).toBeGreaterThanOrEqual(DEFAULT_BASE_PORT);
+    expect(port).toBeLessThan(49152); // below the ephemeral range
+  });
+});
+
+describe("configPathFor", () => {
+  it("puts the engine's config next to the binary, not in the shared user ini", () => {
+    expect(configPathFor(join("/repos/a/build", "zandronum"))).toBe(
+      join("/repos/a/build", "zandronum-mcp.ini"),
+    );
+  });
+});
+
+describe("buildLaunchArgs config", () => {
+  it("passes -config first so later flags win", () => {
+    expect(buildLaunchArgs({ config: "/b/z.ini", iwad: "d2.wad" }).slice(0, 4)).toEqual([
+      "-config",
+      "/b/z.ini",
+      "-iwad",
+      "d2.wad",
+    ]);
+  });
+
+  it("omits -config when none is given", () => {
+    expect(buildLaunchArgs({}).includes("-config")).toBe(false);
   });
 });

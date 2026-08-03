@@ -39,6 +39,9 @@ async function live(opts: LiveOptions = {}): Promise<Harness> {
     config: { basePort: bridge.port, ...opts.config },
     io: opts.io,
   });
+  // Instance numbers are per-session now: a session must claim one before the
+  // other tools will talk to it. Real callers get this from launch_instance.
+  await harness.call("attach_instance");
   return harness;
 }
 
@@ -852,5 +855,105 @@ describe("progress reporting on slow tools", () => {
     );
     // The failed notification must not take the profiling run down with it.
     expect(result.content?.[0]?.text).toBe("1 profiled over 1s");
+  });
+});
+
+describe("session-scoped instances", () => {
+  it("refuses to drive an instance this session never started", async () => {
+    // The collision that motivated this: four editor windows, four MCP servers,
+    // all of which would call the conventional port "instance 1".
+    bridge = await FakeBridge.start();
+    harness = await startHarness({ config: { basePort: bridge.port } });
+    const result = await harness.call("run_command", { text: "version" });
+    expect(result.isError).toBe(true);
+    expect(result.content?.[0]?.text).toMatch(/isn't running in this session/);
+    expect(result.content?.[0]?.text).toMatch(/another editor window's game/);
+  });
+
+  it("attaches explicitly to an engine started outside the session", async () => {
+    bridge = await FakeBridge.start({ hello: { v: 1, t: "hello", engine: "fake", pid: 999 } });
+    harness = await startHarness({ config: { basePort: bridge.port } });
+    bridge.respondTo("version", ["Zandronum 3.2.1"]);
+
+    expect(await harness.text("attach_instance")).toBe(
+      `attached instance 1 to port ${bridge.port} (engine PID 999)`,
+    );
+    // Now the rest of the tools work against it.
+    expect(await harness.text("run_command", { text: "version" })).toBe("Zandronum 3.2.1");
+  });
+
+  it("attaches to an explicitly given port", async () => {
+    bridge = await FakeBridge.start();
+    harness = await startHarness({ config: { basePort: 1 } });
+    expect(await harness.text("attach_instance", { instance: 2, port: bridge.port })).toBe(
+      `attached instance 2 to port ${bridge.port}`,
+    );
+  });
+
+  it("reports a failed attach and leaves no binding behind", async () => {
+    bridge = await FakeBridge.start();
+    const deadPort = bridge.port;
+    await bridge.close();
+    bridge = undefined;
+    harness = await startHarness({ config: { basePort: deadPort } });
+
+    const result = await harness.call("attach_instance");
+    expect(result.isError).toBe(true);
+    expect(result.content?.[0]?.text).toMatch(/Could not attach instance 1/);
+    expect(harness.ctx.isBound(1)).toBe(false);
+  });
+
+  it("frees the instance number again after kill_instance", async () => {
+    const h = await live();
+    expect(h.ctx.isBound(1)).toBe(true);
+    await h.call("kill_instance");
+    expect(h.ctx.isBound(1)).toBe(false);
+  });
+});
+
+describe("reset scoping", () => {
+  it("sweeps only orphans by default, sparing other live sessions", async () => {
+    const seen: Array<boolean | undefined> = [];
+    const h = await offline(
+      { exe: "/engine/zandronum" },
+      {
+        reap: (_exe, opts) => {
+          seen.push(opts?.onlyOrphans);
+          return Promise.resolve({ found: [1], killed: [1], survivors: [] });
+        },
+      },
+    );
+    expect(await h.text("reset")).toBe("Reset complete. Reaped 1 orphaned engine process(es).");
+    expect(seen).toEqual([true]);
+  });
+
+  it("sweeps everything for this build when explicitly asked", async () => {
+    const seen: Array<boolean | undefined> = [];
+    const h = await offline(
+      { exe: "/engine/zandronum" },
+      {
+        reap: (_exe, opts) => {
+          seen.push(opts?.onlyOrphans);
+          return Promise.resolve({ found: [1, 2], killed: [1, 2], survivors: [] });
+        },
+      },
+    );
+    expect(await h.text("reset", { all: true })).toBe("Reset complete. Reaped 2 engine process(es).");
+    expect(seen).toEqual([false]);
+  });
+});
+
+describe("attach_instance failure reporting", () => {
+  it("reports a rejection that isn't an Error", async () => {
+    harness = await startHarness();
+    // Connect failures are normally Errors; make sure a stray non-Error
+    // rejection still reaches the caller instead of becoming "undefined".
+    (harness.ctx.registry as unknown as { attach: unknown }).attach = () =>
+      Promise.reject("socket exploded");
+    const handlers = collectTools(harness.ctx);
+    const result = await handlers.get("attach_instance")!({ instance: 1, port: 9 }, {});
+    expect(result.isError).toBe(true);
+    expect(result.content?.[0]?.text).toMatch(/socket exploded/);
+    expect(harness.ctx.isBound(1)).toBe(false);
   });
 });

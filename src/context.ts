@@ -74,10 +74,17 @@ export const defaultContextIo: ContextIo = {
  * object with injected I/O.
  */
 export class ServerContext {
-  /** Ports actually chosen at launch. `launch_instance` picks the first FREE
-   *  port at or above the conventional one, so a stale process squatting the
-   *  default can't cause a silent mis-attach. */
-  private readonly launchedPorts = new Map<number, number>();
+  /**
+   * Ports this session has actually bound an instance to — by launching it, or
+   * by an explicit attach_instance.
+   *
+   * An instance number is meaningful only WITHIN a session. Several editor
+   * windows each run their own MCP server, and every one of them would call the
+   * conventional port "instance 1"; connecting there on demand meant one
+   * session silently driving another's game. So a tool call for an unbound
+   * instance is an error, not a guess.
+   */
+  private readonly boundPorts = new Map<number, number>();
   /** Per-instance engine console logfile (ZANDRONUM_BRIDGE_LOG). */
   private readonly logFiles = new Map<number, string>();
   /** In-flight attaches, keyed by instance — see `clientFor`. */
@@ -99,13 +106,23 @@ export class ServerContext {
     return this.config.basePort + (instance - 1);
   }
 
-  /** The port an instance is actually on — what launch picked, else conventional. */
+  /** The port an instance is bound to, or the conventional one if unbound. */
   effectivePort(instance: number): number {
-    return this.launchedPorts.get(instance) ?? this.portFor(instance);
+    return this.boundPorts.get(instance) ?? this.portFor(instance);
+  }
+
+  /** Whether this session has claimed an instance number. */
+  isBound(instance: number): boolean {
+    return this.boundPorts.has(instance);
+  }
+
+  /** Claim an instance number for a port, without a launch behind it. */
+  bind(instance: number, port: number): void {
+    this.boundPorts.set(instance, port);
   }
 
   rememberLaunch(instance: number, port: number, logFile: string): void {
-    this.launchedPorts.set(instance, port);
+    this.boundPorts.set(instance, port);
     this.logFiles.set(instance, logFile);
   }
 
@@ -115,13 +132,13 @@ export class ServerContext {
   }
 
   forgetInstance(instance: number): void {
-    this.launchedPorts.delete(instance);
+    this.boundPorts.delete(instance);
     this.logFiles.delete(instance);
     this.enginePids.delete(instance);
   }
 
   forgetAll(): void {
-    this.launchedPorts.clear();
+    this.boundPorts.clear();
     this.logFiles.clear();
     this.enginePids.clear();
   }
@@ -152,6 +169,15 @@ export class ServerContext {
    */
   async clientFor(instance: number): Promise<BridgeClient> {
     if (this.registry.has(instance)) return this.registry.get(instance);
+    if (!this.isBound(instance)) {
+      throw new Error(
+        `Instance ${instance} isn't running in this session. Start it with ` +
+          `launch_instance, or point at an engine you started yourself with ` +
+          `attach_instance. (Instance numbers are per-session — connecting to ` +
+          `whatever happens to be on port ${this.portFor(instance)} could drive ` +
+          `another editor window's game.)`,
+      );
+    }
     const inflight = this.attaching.get(instance);
     if (inflight) return inflight;
     const port = this.effectivePort(instance);

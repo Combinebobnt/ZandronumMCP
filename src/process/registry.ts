@@ -1,6 +1,13 @@
 import { spawn as nodeSpawn } from "node:child_process";
 import { BridgeClient } from "../bridge/transport.js";
-import { buildLaunchArgs, buildLaunchEnv, clearQuarantine, waitForPort, type LaunchOptions } from "./launch.js";
+import {
+  buildLaunchArgs,
+  buildLaunchEnv,
+  clearQuarantine,
+  configPathFor,
+  waitForPort,
+  type LaunchOptions,
+} from "./launch.js";
 
 export interface InstanceConfig {
   id: number;
@@ -91,7 +98,9 @@ export class InstanceRegistry {
   /** Spawn a bridge-enabled instance, wait for its port, then attach. */
   async launch(config: LaunchConfig, io: LaunchIo): Promise<BridgeClient> {
     const host = config.host ?? "127.0.0.1";
-    const args = buildLaunchArgs(config);
+    // Give the engine its own config unless the caller pinned one, so builds
+    // can't trade cvars through the shared user-level ini.
+    const args = buildLaunchArgs({ config: configPathFor(config.exe), ...config });
     const env = buildLaunchEnv(config.exe, config.port);
     if (config.logFile) env.ZANDRONUM_BRIDGE_LOG = config.logFile;
     io.clearQuarantine(config.exe);

@@ -2,7 +2,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createRequire } from "node:module";
-import { resolveEngineExe, resolveScreenshotDir } from "./process/launch.js";
+import { deriveBasePort, resolveEngineExe, resolveScreenshotDir } from "./process/launch.js";
 import { ServerContext, type ServerConfig } from "./context.js";
 import { registerTools } from "./tools.js";
 
@@ -15,7 +15,10 @@ const { version } = createRequire(import.meta.url)("../package.json") as { versi
 const exe = process.env.ZANDRONUM_EXE ? resolveEngineExe(process.env.ZANDRONUM_EXE) : undefined;
 const config: ServerConfig = {
   host: process.env.ZANDRONUM_BRIDGE_HOST ?? "127.0.0.1",
-  basePort: Number.parseInt(process.env.ZANDRONUM_BRIDGE_PORT ?? "7777", 10),
+  // Derived from the engine path unless pinned, so separate checkouts — each
+  // with its own build, each driven by its own editor window — don't all land
+  // on 7777 and fight over it.
+  basePort: deriveBasePort(exe, process.env.ZANDRONUM_BRIDGE_PORT),
   exe,
   // Where the engine writes named screenshots: its own working directory
   // (dirname of the exe), unless ZANDRONUM_SCREENSHOT_DIR overrides.
@@ -67,7 +70,9 @@ async function main(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   // stdout is the MCP channel; logs go to stderr.
-  process.stderr.write(`zandronum-mcp ready (bridge ${config.host}:${config.basePort}+)\n`);
+  process.stderr.write(
+    `zandronum-mcp ready (bridge ${config.host}:${config.basePort}+, engine ${config.exe ?? "unset"})\n`,
+  );
 
   // The client closing stdin (session ended) or a terminating signal both mean
   // "shut down" — reap launched instances first. `exit` is the sync safety net.
