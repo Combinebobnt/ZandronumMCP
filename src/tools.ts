@@ -18,7 +18,15 @@ import { parseBehaviorNames } from "./acs/bytecode.js";
 import { parseRenderInfo, pick } from "./parsers/renderinfo.js";
 import { command, buildPuke, buildPukeName, buildSave } from "./commands/builders.js";
 import { readSaveMeta } from "./saves/png.js";
-import { menuKeyEvent, charEvent, type MenuKey } from "./input/keys.js";
+import {
+  menuKeyEvent,
+  menuKeyUpEvent,
+  charEvent,
+  mouseMoveEvent,
+  mouseButtonEvent,
+  wheelEvent,
+  type MenuKey,
+} from "./input/keys.js";
 
 const instanceArg = z.number().int().positive().default(1);
 const acsScope = z.enum(["world", "global"]);
@@ -115,8 +123,15 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     client: { sendEvent: (a: number, b: number, c: number, d: number) => void },
     key: MenuKey,
   ) {
-    const ev = menuKeyEvent(key);
-    client.sendEvent(ev.evtype, ev.subtype, ev.data1, ev.data2);
+    const down = menuKeyEvent(key);
+    client.sendEvent(down.evtype, down.subtype, down.data1, down.data2);
+
+    // The RELEASE, which used to be missing. M_Responder latches a key into MenuButtons[] on the way
+    // down and unlatches it on the way up, and M_Ticker repeats whatever is still latched -- so a
+    // single unreleased "down" walked the selection down the whole list and kept going. Without this
+    // the caller is testing an auto-repeat, not a keypress.
+    const up = menuKeyUpEvent(key);
+    client.sendEvent(up.evtype, up.subtype, up.data1, up.data2);
   }
 
   // --- commands, cheats & input ---------------------------------------------
@@ -364,6 +379,101 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
         }
       });
       return { content: [{ type: "text", text: `typed "${text}"` }] };
+    },
+  );
+
+  server.registerTool(
+    "mouse_move",
+    {
+      title: "Move the mouse pointer",
+      description:
+        "Move the pointer to a screen position, in pixels from the top-left of the game window. Drives hover-only UI -- tooltips, hot states -- which nothing else here can reach.",
+      inputSchema: { instance: instanceArg, x: z.number().int(), y: z.number().int() },
+    },
+    async ({ instance, x, y }) => {
+      const client = await ctx.clientFor(instance);
+      if (!client.supports("event")) {
+        return { isError: true, content: [{ type: "text", text: NO_INPUT_CAP }] };
+      }
+      const ev = mouseMoveEvent(x, y);
+      client.sendEvent(ev.evtype, ev.subtype, ev.data1, ev.data2);
+      return { content: [{ type: "text", text: `pointer at ${x},${y}` }] };
+    },
+  );
+
+  server.registerTool(
+    "mouse_click",
+    {
+      title: "Click or drag the mouse",
+      description:
+        "Press and release the left button at a position. Give toX/toY to DRAG: press at the first point, move through it, release at the second. `double` sends a double-click.",
+      inputSchema: {
+        instance: instanceArg,
+        x: z.number().int(),
+        y: z.number().int(),
+        toX: z.number().int().optional(),
+        toY: z.number().int().optional(),
+        double: z.boolean().optional(),
+      },
+    },
+    async ({ instance, x, y, toX, toY, double }) => {
+      const client = await ctx.clientFor(instance);
+      if (!client.supports("event")) {
+        return { isError: true, content: [{ type: "text", text: NO_INPUT_CAP }] };
+      }
+      const post = (e: { evtype: number; subtype: number; data1: number; data2: number }) =>
+        client.sendEvent(e.evtype, e.subtype, e.data1, e.data2);
+
+      // Move first: menus track the pointer from motion, so a click at a position they have never
+      // seen the pointer at lands on whatever was hovered last.
+      post(mouseMoveEvent(x, y));
+      await sleep(20);
+      post(mouseButtonEvent(x, y, true, double === true));
+      await sleep(30);
+
+      if (toX !== undefined && toY !== undefined) {
+        // Intermediate positions, because a drag that jumps straight to the end never gives the menu
+        // the motion it is meant to be tracking.
+        for (let i = 1; i <= 4; i++) {
+          post(
+            mouseMoveEvent(
+              Math.round(x + ((toX - x) * i) / 4),
+              Math.round(y + ((toY - y) * i) / 4),
+            ),
+          );
+          await sleep(20);
+        }
+        post(mouseButtonEvent(toX, toY, false));
+        return { content: [{ type: "text", text: `dragged ${x},${y} -> ${toX},${toY}` }] };
+      }
+
+      post(mouseButtonEvent(x, y, false));
+      return { content: [{ type: "text", text: `clicked ${x},${y}${double ? " (double)" : ""}` }] };
+    },
+  );
+
+  server.registerTool(
+    "mouse_wheel",
+    {
+      title: "Scroll the mouse wheel",
+      description:
+        "Wheel notches at the current pointer position. Positive scrolls up, negative down.",
+      inputSchema: { instance: instanceArg, notches: z.number().int() },
+    },
+    async ({ instance, notches }) => {
+      const client = await ctx.clientFor(instance);
+      if (!client.supports("event")) {
+        return { isError: true, content: [{ type: "text", text: NO_INPUT_CAP }] };
+      }
+      const count = Math.min(Math.abs(notches), 30);
+      for (let i = 0; i < count; i++) {
+        const ev = wheelEvent(notches > 0);
+        client.sendEvent(ev.evtype, ev.subtype, ev.data1, ev.data2);
+        await sleep(25);
+      }
+      return {
+        content: [{ type: "text", text: `${count} notch(es) ${notches > 0 ? "up" : "down"}` }],
+      };
     },
   );
 

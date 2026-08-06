@@ -166,12 +166,19 @@ describe("input tools", () => {
     expect((await received).evtype).toBeGreaterThanOrEqual(0);
   });
 
-  it("sends a sequence of menu keys", async () => {
+  it("sends a sequence of menu keys, releasing each one", async () => {
     const h = await live();
     expect(await h.text("menu_nav", { steps: ["down", "down", "enter"] })).toBe(
       "sent 3 key(s): down down enter",
     );
-    await settle(() => bridge!.events.length === 3);
+
+    // TWO events per key: the press and the release. Sending only the press latches the key in the
+    // engine's MenuButtons[] and M_Ticker repeats it for ever, so one "down" walks the selection down
+    // the whole list -- an auto-repeat, not the keypress the caller asked for.
+    await settle(() => bridge!.events.length === 6);
+
+    const subtypes = bridge!.events.map((e: { subtype: number }) => e.subtype);
+    expect(subtypes).toEqual([1, 3, 1, 3, 1, 3]); // EV_GUI_KeyDown, EV_GUI_KeyUp, ...
   });
 
   it("types a string one character at a time", async () => {
@@ -184,7 +191,7 @@ describe("input tools", () => {
     const h = await live({ responses: { menu_options: ["opened"] } });
     const result = await h.call("verify_menu", { open: "menu_options", steps: ["down"] });
     expect(result.content?.[0]).toMatchObject({ type: "image" });
-    await settle(() => bridge!.events.length === 1);
+    await settle(() => bridge!.events.length === 2); // press + release
   });
 
   it("screenshots without opening or navigating when neither is asked for", async () => {
