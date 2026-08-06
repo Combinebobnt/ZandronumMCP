@@ -10,7 +10,16 @@
 
 export const EV_GUI_EVENT = 4;
 export const EV_GUI_KEYDOWN = 1;
+export const EV_GUI_KEYUP = 3;
 export const EV_GUI_CHAR = 4;
+
+// Mouse events, from the same EGUIEvent enum. EV_GUI_FirstMouseEvent is 5, so:
+export const EV_GUI_MOUSEMOVE = 6;
+export const EV_GUI_LBUTTONDOWN = 7;
+export const EV_GUI_LBUTTONUP = 8;
+export const EV_GUI_LBUTTONDBLCLICK = 9;
+export const EV_GUI_WHEELUP = 16;
+export const EV_GUI_WHEELDOWN = 17;
 
 const GK = {
   left: 5,
@@ -44,6 +53,37 @@ export interface InputEvent {
 /** Build the GUI key-down event the menu system responds to for a named key. */
 export function menuKeyEvent(key: MenuKey): InputEvent {
   return { evtype: EV_GUI_EVENT, subtype: EV_GUI_KEYDOWN, data1: MENU_KEY_CODE[key], data2: 0 };
+}
+
+/**
+ * The matching key-UP.
+ *
+ * Sending only the key-down is a trap. M_Responder latches the key into MenuButtons[] on the way
+ * down and unlatches it on the way up, and M_Ticker repeats whatever is still latched -- so a single
+ * "down" delivered without its release walks the selection down the whole list and keeps going. Every
+ * key this bridge sends must be released, or the caller is testing an auto-repeat rather than a
+ * keypress.
+ */
+export function menuKeyUpEvent(key: MenuKey): InputEvent {
+  return { evtype: EV_GUI_EVENT, subtype: EV_GUI_KEYUP, data1: MENU_KEY_CODE[key], data2: 0 };
+}
+
+/** Pointer motion, so hover-driven UI (tooltips, hot states) can be exercised. */
+export function mouseMoveEvent(x: number, y: number): InputEvent {
+  return { evtype: EV_GUI_EVENT, subtype: EV_GUI_MOUSEMOVE, data1: x, data2: y };
+}
+
+export function mouseButtonEvent(x: number, y: number, down: boolean, dblclick = false): InputEvent {
+  const subtype = dblclick
+    ? EV_GUI_LBUTTONDBLCLICK
+    : down
+      ? EV_GUI_LBUTTONDOWN
+      : EV_GUI_LBUTTONUP;
+  return { evtype: EV_GUI_EVENT, subtype, data1: x, data2: y };
+}
+
+export function wheelEvent(up: boolean): InputEvent {
+  return { evtype: EV_GUI_EVENT, subtype: up ? EV_GUI_WHEELUP : EV_GUI_WHEELDOWN, data1: 0, data2: 0 };
 }
 
 /** Build the GUI character event a menu text field appends (one character). */
