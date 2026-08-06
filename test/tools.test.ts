@@ -181,6 +181,82 @@ describe("input tools", () => {
     expect(subtypes).toEqual([1, 3, 1, 3, 1, 3]); // EV_GUI_KeyDown, EV_GUI_KeyUp, ...
   });
 
+  it("moves the pointer", async () => {
+    const h = await live();
+    expect(await h.text("mouse_move", { x: 120, y: 240 })).toBe("pointer at 120,240");
+    await settle(() => bridge!.events.length === 1);
+
+    const ev = bridge!.events[0];
+    expect(ev.subtype).toBe(6); // EV_GUI_MouseMove
+    expect(ev.data1).toBe(120);
+    expect(ev.data2).toBe(240);
+  });
+
+  it("clicks by moving, pressing and releasing", async () => {
+    const h = await live();
+    expect(await h.text("mouse_click", { x: 10, y: 20 })).toBe("clicked 10,20");
+
+    // The MOVE first matters: menus track the pointer from motion, so a press at a position they
+    // have never seen it at lands on whatever was hovered last.
+    await settle(() => bridge!.events.length === 3);
+    expect(bridge!.events.map((e: { subtype: number }) => e.subtype)).toEqual([6, 7, 8]);
+  });
+
+  it("sends a double-click when asked", async () => {
+    const h = await live();
+    expect(await h.text("mouse_click", { x: 10, y: 20, double: true })).toBe(
+      "clicked 10,20 (double)",
+    );
+    await settle(() => bridge!.events.length === 3);
+    expect(bridge!.events[1].subtype).toBe(9); // EV_GUI_LButtonDblClick
+  });
+
+  it("drags through intermediate positions", async () => {
+    const h = await live();
+    expect(await h.text("mouse_click", { x: 0, y: 0, toX: 100, toY: 40 })).toBe(
+      "dragged 0,0 -> 100,40",
+    );
+
+    // Move, press, four steps along the way, release. A drag that jumped straight to the end would
+    // never give the menu the motion it is meant to be tracking.
+    await settle(() => bridge!.events.length === 7);
+    expect(bridge!.events.map((e: { subtype: number }) => e.subtype)).toEqual([6, 7, 6, 6, 6, 6, 8]);
+
+    const last = bridge!.events[bridge!.events.length - 1];
+    expect(last.data1).toBe(100);
+    expect(last.data2).toBe(40);
+  });
+
+  it("scrolls the wheel up and down", async () => {
+    const h = await live();
+    expect(await h.text("mouse_wheel", { notches: 2 })).toBe("2 notch(es) up");
+    await settle(() => bridge!.events.length === 2);
+    expect(bridge!.events.every((e: { subtype: number }) => e.subtype === 16)).toBe(true);
+
+    expect(await h.text("mouse_wheel", { notches: -1 })).toBe("1 notch(es) down");
+    await settle(() => bridge!.events.length === 3);
+    expect(bridge!.events[2].subtype).toBe(17);
+  });
+
+  it("caps a silly number of wheel notches", async () => {
+    const h = await live();
+    expect(await h.text("mouse_wheel", { notches: 5000 })).toBe("30 notch(es) up");
+    await settle(() => bridge!.events.length === 30);
+  });
+
+  it("refuses mouse input when the bridge cannot post events", async () => {
+    const h = await live({ caps: ["cmd"] });
+
+    for (const [tool, args] of [
+      ["mouse_move", { x: 1, y: 1 }],
+      ["mouse_click", { x: 1, y: 1 }],
+      ["mouse_wheel", { notches: 1 }],
+    ] as const) {
+      const result = await h.call(tool, args);
+      expect(result.isError).toBe(true);
+    }
+  });
+
   it("types a string one character at a time", async () => {
     const h = await live();
     expect(await h.text("menu_text", { text: "hi" })).toBe('typed "hi"');
