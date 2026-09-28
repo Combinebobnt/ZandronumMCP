@@ -73,3 +73,9 @@ export function readLogWindow(log: string, opts: LogWindowOptions): LogWindow {
 export function crashLogPath(logPath: string): string {
   return `${logPath}.crash`;
 }
+
+/** The `pid:` line mcp_crash.cpp writes into every report, or undefined if absent. */
+export function crashReportPid(report: string): number | undefined {
+  const m = /^pid: (\d+)\r?$/m.exec(report);
+  return m ? Number(m[1]) : undefined;
+}

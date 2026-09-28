@@ -276,6 +276,7 @@ describe("defaultContextIo", () => {
     expect(defaultContextIo.readTextSync(here)).toContain("defaultContextIo");
     expect(defaultContextIo.readdirSync(path.dirname(here))).toContain("context.test.ts");
     expect(defaultContextIo.stampOf(here)).toMatch(/^\d+(\.\d+)?:\d+$/);
+    expect(defaultContextIo.mtimeOf(here).getTime()).toBeGreaterThan(0);
     await expect(defaultContextIo.sleep(0)).resolves.toBeUndefined();
     const ticks = await new Promise<number>((resolve) => {
       let n = 0;

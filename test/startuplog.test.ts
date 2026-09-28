@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseStartupErrors, tailLines, crashLogPath, readLogWindow } from "../src/process/startuplog.js";
+import { parseStartupErrors, tailLines, crashLogPath, readLogWindow, crashReportPid } from "../src/process/startuplog.js";
 
 const SAMPLE = [
   "Resolving GL extensions",
@@ -91,5 +91,13 @@ describe("readLogWindow", () => {
 
   it("throws on an invalid pattern", () => {
     expect(() => readLogWindow(LOG, { pattern: "(", maxLines: 5 })).toThrow();
+  });
+});
+
+describe("crashReportPid", () => {
+  it("reads the pid line from either platform's report, or undefined", () => {
+    expect(crashReportPid("=== MCP ENGINE CRASH ===\nsignal: 11 SIGSEGV\nfault_addr: 0x8\npid: 31337\n\nbacktrace:\n")).toBe(31337);
+    expect(crashReportPid("code: 0xc0000005\r\npid: 7\r\n")).toBe(7);
+    expect(crashReportPid("no pid here\n#0 pid: 5 in a frame")).toBeUndefined();
   });
 });

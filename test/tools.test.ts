@@ -1514,7 +1514,32 @@ describe("diagnostic tools", () => {
       { exe: "/engine/zandronum" },
       { existsSync: () => true, readTextSync: () => "SIGSEGV at 0x0\n#0 R_DrawColumn" },
     );
-    expect(await h.text("get_crash")).toMatch(/SIGSEGV at 0x0/);
+    const text = await h.text("get_crash");
+    expect(text).toMatch(/SIGSEGV at 0x0/);
+    expect(text).toMatch(/^Unverified: this instance's engine PID is unknown/);
+  });
+
+  const crashReport = (pid: number) => `=== MCP ENGINE CRASH ===\nsignal: 11 SIGSEGV\npid: ${pid}\n\nbacktrace:\n#0 R_DrawColumn`;
+
+  it("returns the report verbatim when its pid matches this instance's engine", async () => {
+    const h = await offline({ exe: "/engine/zandronum" }, { existsSync: () => true, readTextSync: () => crashReport(4242) });
+    h.ctx.rememberEngine(1, 4242);
+    expect(await h.text("get_crash")).toBe(crashReport(4242));
+  });
+
+  it("names an earlier engine's report instead of returning it", async () => {
+    const h = await offline({ exe: "/engine/zandronum" }, { existsSync: () => true, readTextSync: () => crashReport(99) });
+    h.ctx.rememberEngine(1, 4242);
+    const text = await h.text("get_crash");
+    expect(text).toMatch(/^No crash recorded for instance 1 \(PID 4242\)\./);
+    expect(text).toMatch(/earlier engine's crash \(PID 99, written 2026-09-22T06:10:00\.000Z\)/);
+    expect(text).not.toMatch(/R_DrawColumn/);
+  });
+
+  it("flags a report with no pid line as unverified", async () => {
+    const h = await offline({ exe: "/engine/zandronum" }, { existsSync: () => true, readTextSync: () => "SIGSEGV\n#0 x" });
+    h.ctx.rememberEngine(1, 4242);
+    expect(await h.text("get_crash")).toMatch(/^Unverified: the report has no pid line, .*\n\nSIGSEGV\n#0 x$/);
   });
 });
 

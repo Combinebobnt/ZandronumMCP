@@ -3,7 +3,7 @@ import type { ZodRawShapeCompat } from "@modelcontextprotocol/sdk/server/zod-com
 import { z } from "zod";
 import path from "node:path";
 import type { ServerContext } from "./context.js";
-import { parseStartupErrors, tailLines, crashLogPath, readLogWindow } from "./process/startuplog.js";
+import { parseStartupErrors, tailLines, crashLogPath, readLogWindow, crashReportPid } from "./process/startuplog.js";
 import { parseDumpActors } from "./parsers/dumpactors.js";
 import { parseScriptStat } from "./parsers/scriptstat.js";
 import { parseAcsVars } from "./parsers/acsvars.js";
@@ -2164,7 +2164,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     {
       title: "Get the last engine crash backtrace",
       description:
-        "Return the signal, faulting address, and symbolized backtrace the bridge's crash handler captured the last time the engine crashed (segfault/abort/bus error/etc.). Use this when an instance dies unexpectedly — e.g. run_command reports the bridge closed. Empty if the instance has not crashed.",
+        "Return the signal, faulting address, and symbolized backtrace the bridge's crash handler captured the last time the engine crashed (segfault/abort/bus error/etc.). Use this when an instance dies unexpectedly — e.g. run_command reports the bridge closed. Empty if the instance has not crashed. A report left by an earlier engine (different PID) is named but not returned as this instance's crash.",
       inputSchema: { instance: instanceArg },
     },
     async ({ instance }) => {
@@ -2180,7 +2180,34 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
           ],
         };
       }
-      return { content: [{ type: "text", text: ctx.io.readTextSync(crashFile) }] };
+      // The file survives across launches, so only a report from this instance's
+      // own engine PID counts as its crash.
+      const report = ctx.io.readTextSync(crashFile);
+      const ours = ctx.enginePidFor(instance);
+      const theirs = crashReportPid(report);
+      if (ours !== undefined && theirs === ours) return { content: [{ type: "text", text: report }] };
+      const written = ctx.io.mtimeOf(crashFile).toISOString();
+      if (ours !== undefined && theirs !== undefined) {
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `No crash recorded for instance ${instance} (PID ${ours}). ${crashFile} holds an ` +
+                `earlier engine's crash (PID ${theirs}, written ${written}), not this one's.`,
+            },
+          ],
+        };
+      }
+      const why = ours === undefined ? "this instance's engine PID is unknown" : "the report has no pid line";
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Unverified: ${why}, so this may be an earlier engine's crash (written ${written}).\n\n${report}`,
+          },
+        ],
+      };
     },
   );
 }

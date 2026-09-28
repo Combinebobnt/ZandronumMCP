@@ -36,6 +36,7 @@ export interface ContextIo {
   readdirSync: (p: string) => string[];
   /** Change-detection stamp for a file; used to invalidate parse caches. */
   stampOf: (p: string) => string;
+  mtimeOf: (p: string) => Date;
   sleep: (ms: number) => Promise<void>;
   /** Run `fn` every `ms` until the returned cancel is called. */
   every: (ms: number, fn: () => void) => () => void;
@@ -61,6 +62,7 @@ export const defaultContextIo: ContextIo = {
     const s = statSync(p);
     return `${s.mtimeMs}:${s.size}`;
   },
+  mtimeOf: (p) => statSync(p).mtime,
   sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   every: (ms, fn) => {
     const timer = setInterval(fn, ms);
@@ -141,6 +143,11 @@ export class ServerContext {
   /** Record which process an instance's bridge belongs to, once it says so. */
   rememberEngine(instance: number, pid: number | undefined): void {
     if (pid !== undefined) this.enginePids.set(instance, pid);
+  }
+
+  /** The engine PID the instance's bridge reported, if it has. */
+  enginePidFor(instance: number): number | undefined {
+    return this.enginePids.get(instance);
   }
 
   forgetInstance(instance: number): void {
