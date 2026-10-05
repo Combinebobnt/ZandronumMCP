@@ -458,15 +458,19 @@ describe("savegame and demo tools", () => {
     expect((await h.call("list_saves")).isError).toBe(true);
   });
 
-  it("treats a save without the engine's confirmation as a failure", async () => {
-    const h = await live({ responses: { "save good": ["Game saved."] } });
+  it("accepts a confirmed or silent (queued) save and fails on any other output", async () => {
+    const h = await live({ responses: { "save good": ["Game saved."], "save bad": ["not in a level"] } });
     const ok = await h.call("save_game", { name: "good", description: "a slot" });
     expect(ok.isError).toBe(false);
     expect(ok.content?.[0]?.text).toBe("Game saved.");
 
+    const queued = await h.call("save_game", { name: "later" });
+    expect(queued.isError).toBe(false);
+    expect(queued.content?.[0]?.text).toBe("save queued; confirm with list_saves");
+
     const bad = await h.call("save_game", { name: "bad" });
     expect(bad.isError).toBe(true);
-    expect(bad.content?.[0]?.text).toBe("(no output)");
+    expect(bad.content?.[0]?.text).toBe("not in a level");
   });
 
   it("loads a savegame and plays a demo", async () => {
