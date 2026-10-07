@@ -13,7 +13,9 @@ import { parseAcsProfile } from "./parsers/acsprofile.js";
 import { cleanConsoleLines } from "./parsers/consoletext.js";
 import { parsePlayerState, parseTarget, withLiveStatus } from "./parsers/playerstate.js";
 import { pollUntil } from "./poll.js";
-import { parseActorState, parseActorsNear } from "./parsers/actorstate.js";
+import { parseActorState, parseActorsNear, parseFindActors } from "./parsers/actorstate.js";
+import { parsePlayers } from "./parsers/players.js";
+import { parseKvLines, firstError, hasHeader, failureText } from "./parsers/lines.js";
 import { parseHud } from "./parsers/hud.js";
 import { describeStatus } from "./parsers/status.js";
 import type { BridgeClient } from "./bridge/transport.js";
@@ -21,7 +23,7 @@ import { findSymbol } from "./acs/symbols.js";
 import { collectAcsLumps, collectAcsModules } from "./acs/collect.js";
 import { parseBehaviorNames, parseMapExports } from "./acs/bytecode.js";
 import { parseRenderInfo, pick } from "./parsers/renderinfo.js";
-import { command, buildPuke, buildPukeName, buildSave } from "./commands/builders.js";
+import { command, kvArgs, buildPuke, buildPukeName, buildSave } from "./commands/builders.js";
 import { readSaveMeta } from "./saves/png.js";
 import {
   menuKeyEvent,
@@ -38,6 +40,21 @@ const acsScope = z.enum(["world", "global"]);
 const acsSrcArg = z.string().optional();
 const acsName = z.string().min(1);
 const mapFileArg = z.string().optional();
+const className = z.string().regex(/^\S+$/, "a class name has no spaces");
+
+/** `set_cheat` names: each is its own stock toggle CCMD, keyed to its `CF_*` bit (d_player.h). */
+const CHEATS = {
+  noclip: 1 << 0,
+  god: 1 << 1,
+  notarget: 1 << 3,
+  fly: 1 << 4,
+  buddha: 1 << 27,
+  noclip2: 1 << 30,
+} as const;
+const CHEAT_NAMES = Object.keys(CHEATS) as [keyof typeof CHEATS, ...(keyof typeof CHEATS)[]];
+// A queued cheat lands on the next tic; about 2s of polling covers a busy frame.
+const CHEAT_POLLS = 20;
+const CHEAT_POLL_MS = 100;
 
 const MENU_KEYS = ["up", "down", "left", "right", "enter", "back", "backspace"] as const;
 
@@ -49,6 +66,11 @@ const profileLimit = z.number().int().positive().optional();
 function profileCommand(sort?: string, limit?: number): string {
   if (!sort) return "acsprofile";
   return command("acsprofile", sort, ...(limit !== undefined ? [limit] : []));
+}
+
+/** The isError result for a CCMD that gave no usable reply (see `failureText`). */
+function failed(output: string[]) {
+  return { isError: true, content: [{ type: "text" as const, text: failureText(output) }] };
 }
 
 /**
@@ -958,12 +980,27 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     {
       title: "Actor state (DECORATE)",
       description:
-        "Run `dumpactor` and return an actor's live state: class, health, position, current DECORATE state (sprite/frame/tics, e.g. TNT1 A 0), inventory, and (for players) ready weapon + morph status. Defaults to the player; pass a TID for any actor.",
-      inputSchema: { instance: instanceArg, tid: z.number().int().min(0).optional() },
+        "Run `dumpactor` and return an actor's live state: class, health, position, angle, pitch, current DECORATE state (sprite/frame/tics, e.g. TNT1 A 0), inventory, and (for players) ready weapon + morph status. Defaults to the player; pass a TID for any actor, plus index for the nth actor sharing it.",
+      inputSchema: {
+        instance: instanceArg,
+        tid: z.number().int().min(0).optional(),
+        index: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe("Pick the nth (0-based) actor sharing the TID; needs tid."),
+      },
     },
-    async ({ instance, tid }) => {
+    async ({ instance, tid, index }) => {
+      if (index !== undefined && tid === undefined) {
+        return { isError: true, content: [{ type: "text", text: "index needs a tid" }] };
+      }
       const client = await ctx.clientFor(instance);
-      const cmd = tid !== undefined ? command("dumpactor", tid) : "dumpactor";
+      const cmd =
+        tid === undefined
+          ? "dumpactor"
+          : command("dumpactor", tid, ...(index !== undefined ? [index] : []));
       const state = parseActorState(await client.runCommand(cmd));
       if (state.class === null) {
         return {
@@ -1037,6 +1074,140 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
       return {
         content: [{ type: "text", text: JSON.stringify(target) }],
         structuredContent: { ...target },
+      };
+    },
+  );
+
+  registerLive(
+    "set_cheat",
+    {
+      title: "Set a cheat on or off",
+      description:
+        "Idempotently turn a player cheat on or off. Reads the cheat bit from the engine-state snapshot and only runs the stock toggle CCMD (god, notarget, ...) when it differs, then waits for the bit to flip, so a blind toggle can never switch it the wrong way. Uses the engine's normal net path. Needs a bridge with the status cap and a cheats= field.",
+      inputSchema: {
+        instance: instanceArg,
+        name: z.enum(CHEAT_NAMES),
+        on: z.boolean(),
+      },
+    },
+    async ({ instance, name, on }) => {
+      const client = await ctx.clientFor(instance);
+      const bit = CHEATS[name];
+      const read = () => {
+        const cheats = client.lastStatus?.cheats;
+        return cheats === undefined ? undefined : (Number(cheats) & bit) !== 0;
+      };
+      await client.refreshStatus();
+      if (read() === undefined) {
+        const why = client.lastStatus
+          ? "the engine's status snapshot has no cheats= field (rebuild the engine with the latest overlay), or there is no player"
+          : "this engine bridge has no status support (rebuild with the latest bridge)";
+        return { isError: true, content: [{ type: "text", text: `can't read cheat state: ${why}` }] };
+      }
+      const want = on ? "on" : "off";
+      if (read() === on) {
+        return { content: [{ type: "text", text: `${name} already ${want}; no change` }] };
+      }
+      const output = await client.runCommand(name);
+      for (let i = 0; i < CHEAT_POLLS && read() !== on; i++) {
+        await sleep(CHEAT_POLL_MS);
+        await client.refreshStatus();
+      }
+      if (read() !== on) {
+        const said = output.join("\n").trim() || "(no output)";
+        return {
+          isError: true,
+          content: [{ type: "text", text: `${name} did not turn ${want}; the engine said: ${said}` }],
+        };
+      }
+      return { content: [{ type: "text", text: `${name} ${want}` }] };
+    },
+  );
+
+  registerLive(
+    "set_view",
+    {
+      title: "Set the player's view",
+      description:
+        "Point the player's view: an absolute angle (degrees, Doom convention: 0 east, 90 north) with optional pitch (degrees, negative looks up), or face an actor by tid (first actor with it) or class (nearest map actor of that class, aiming at its mid-height). Give exactly one of angle, tid, class.",
+      inputSchema: {
+        instance: instanceArg,
+        angle: z.number().finite().optional(),
+        pitch: z.number().finite().optional(),
+        tid: z.number().int().min(1).optional(),
+        class: className.optional(),
+      },
+    },
+    async ({ instance, angle, pitch, tid, class: cls }) => {
+      const modes = [angle, tid, cls].filter((m) => m !== undefined).length;
+      if (modes !== 1 || (pitch !== undefined && angle === undefined)) {
+        return {
+          isError: true,
+          content: [
+            { type: "text", text: "give exactly one of angle, tid or class (pitch only with angle)" },
+          ],
+        };
+      }
+      const cmd =
+        angle !== undefined
+          ? command("mcp_setview", String(angle), ...(pitch !== undefined ? [String(pitch)] : []))
+          : command("mcp_setview", ...kvArgs({ tid, class: cls }));
+      const client = await ctx.clientFor(instance);
+      const output = await client.runCommand(cmd);
+      const view = parseKvLines(output, "view")[0];
+      if (!view) return failed(output);
+      return {
+        content: [{ type: "text", text: JSON.stringify(view) }],
+        structuredContent: { ...view },
+      };
+    },
+  );
+
+  registerLive(
+    "list_players",
+    {
+      title: "List players",
+      description:
+        "Run `dumpplayers` and return every in-game player: slot, bot, spectator/dead-spectator, player state, health, armor, ready weapon, x/y/z, angle, pitch, TID, cheat bits, frags, deaths, kills/items/secrets, points, wins, team, ping and name. Bots join at slot 1+.",
+      inputSchema: { instance: instanceArg },
+    },
+    async ({ instance }) => {
+      const client = await ctx.clientFor(instance);
+      const output = await client.runCommand("dumpplayers");
+      if (!hasHeader(output, "MCP_PLAYERS")) return failed(output);
+      const players = parsePlayers(output);
+      return {
+        content: [{ type: "text", text: `${players.length} player(s)` }],
+        structuredContent: { players },
+      };
+    },
+  );
+
+  registerLive(
+    "find_actors",
+    {
+      title: "Find actors map-wide",
+      description:
+        "Run `findactors` and list map actors (owned inventory excluded), optionally filtered by class (includes subclasses), TID and radius around the player, sorted by distance. Each has class, tid, hp/spawnhp, x/y/z, angle, pitch, dist, sprite/frame, flags (monster, friendly, corpse, dormant, shootable, solid, invulnerable, ambush) and target. detail adds master/tracer, special + args, vel, radius/height, floorz and player index. With a tid filter each result also has index, the one to pass to actor_state(tid, index) for it (the list is in distance order, not index order).",
+      inputSchema: {
+        instance: instanceArg,
+        class: className.optional(),
+        tid: z.number().int().min(1).optional(),
+        radius: z.number().int().positive().optional(),
+        limit: z.number().int().positive().optional(),
+        detail: z.boolean().optional(),
+      },
+    },
+    async ({ instance, class: cls, tid, radius, limit, detail }) => {
+      const args = kvArgs({ class: cls, tid, radius, limit, detail: detail ? 1 : undefined });
+      const client = await ctx.clientFor(instance);
+      const output = await client.runCommand(command("findactors", ...args));
+      if (firstError(output) !== undefined || !hasHeader(output, "MCP_FOUND")) return failed(output);
+      const found = parseFindActors(output);
+      const cut = found.truncated ? ` (showing ${found.truncated.shown} of ${found.truncated.total})` : "";
+      return {
+        content: [{ type: "text", text: `${found.actors.length} actor(s) found${cut}` }],
+        structuredContent: { ...found },
       };
     },
   );

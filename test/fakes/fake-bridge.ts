@@ -39,6 +39,8 @@ const DEFAULT_STATUS: Record<string, string> = {
   automap: "0",
   health: "100",
   armor: "0",
+  cheats: "0",
+  maptime: "0",
 };
 
 export class FakeBridge {
@@ -50,6 +52,7 @@ export class FakeBridge {
   private probesToSwallow = 0;
   private readonly rawHandlers: Array<{ match: string; messages: Record<string, unknown>[] }> = [];
   private readonly swallowed: string[] = [];
+  private readonly commandHooks: Array<{ match: string; run: () => void }> = [];
   /** Every message the client sent — lets tests assert fire-and-forget sends. */
   readonly received: Array<{ t?: string; text?: string }> = [];
   private readonly swallowCommands: boolean;
@@ -59,7 +62,7 @@ export class FakeBridge {
   readonly events: RecordedEvent[] = [];
   readonly pauses: number[] = [];
   /** Fields echoed back on the mcp_status correlator line. Override with `setStatus`. */
-  private status: Record<string, string> = DEFAULT_STATUS;
+  private status: Record<string, string | undefined> = DEFAULT_STATUS;
   port = 0;
 
   private constructor(server: net.Server, opts: FakeBridgeOptions) {
@@ -100,6 +103,14 @@ export class FakeBridge {
     return this;
   }
 
+  /** Run `run` whenever a command containing `match` arrives, before the reply
+   *  is built, so a test can model a command's side effect (e.g. a cheat
+   *  toggling the status snapshot). */
+  onCommand(match: string, run: () => void): this {
+    this.commandHooks.push({ match, run });
+    return this;
+  }
+
   /** Accept commands containing `match` but never reply — a deterministic
    *  per-command timeout, without swallowing every other command too. */
   swallow(match: string): this {
@@ -121,7 +132,7 @@ export class FakeBridge {
   }
 
   /** Override/merge fields in the `mcp_status` snapshot this fake returns. */
-  setStatus(fields: Record<string, string>): this {
+  setStatus(fields: Record<string, string | undefined>): this {
     this.status = { ...this.status, ...fields };
     return this;
   }
@@ -196,6 +207,7 @@ export class FakeBridge {
       this.probesToSwallow--;
       return;
     }
+    for (const h of this.commandHooks) if (command.includes(h.match)) h.run();
 
     const raw = this.rawHandlers.find((h) => command.includes(h.match));
     const handler = raw ? undefined : this.handlers.find((h) => command.includes(h.match));
@@ -211,6 +223,7 @@ export class FakeBridge {
 
     if (statusMatch && sentinel) {
       const fields = Object.entries({ ...this.status, ...this.statusQueue.shift() })
+        .filter(([, v]) => v !== undefined)
         .map(([k, v]) => `${k}=${v}`)
         .join(" ");
       socket.write(

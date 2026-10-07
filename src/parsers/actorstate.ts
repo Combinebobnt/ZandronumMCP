@@ -1,3 +1,5 @@
+import { matchLines, parseKvLines, type KvRecord } from "./lines.js";
+
 export interface DecorateState {
   sprite: string;
   frame: string;
@@ -15,6 +17,7 @@ export interface ActorState {
   health: number | null;
   pos: { x: number; y: number; z: number } | null;
   angle: number | null;
+  pitch: number | null;
   state: DecorateState | null;
   weapon: string | null;
   morphTics: number | null;
@@ -28,6 +31,7 @@ export function parseActorState(lines: string[]): ActorState {
     health: null,
     pos: null,
     angle: null,
+    pitch: null,
     state: null,
     weapon: null,
     morphTics: null,
@@ -48,6 +52,9 @@ export function parseActorState(lines: string[]): ActorState {
           break;
         case "angle":
           out.angle = Number(f[1]);
+          break;
+        case "pitch":
+          out.pitch = Number(f[1]);
           break;
         case "state":
           out.state = { sprite: f[1], frame: f[2], tics: Number(f[3]) };
@@ -95,4 +102,36 @@ export function parseActorsNear(lines: string[]): NearbyActor[] {
     }
   }
   return out;
+}
+
+/** `findactors`' `flags=` letters; mirrors `MCP_FlagLetters` in mcp_actorstate.cpp. */
+const FLAG_LETTERS: Record<string, string> = {
+  m: "monster",
+  f: "friendly",
+  c: "corpse",
+  d: "dormant",
+  s: "shootable",
+  o: "solid",
+  i: "invulnerable",
+  a: "ambush",
+};
+
+export interface FoundActors {
+  actors: KvRecord[];
+  /** Set when `limit` cut the list short. */
+  truncated?: { shown: number; total: number };
+}
+
+/** Parse `findactors` output, expanding `flags=` letters into names. */
+export function parseFindActors(lines: string[]): FoundActors {
+  const actors = parseKvLines(lines, "found").map((a) => {
+    if (typeof a.flags !== "string") return a;
+    const flags = [...a.flags].flatMap((c) => (FLAG_LETTERS[c] ? [FLAG_LETTERS[c]] : []));
+    return { ...a, flags: flags.join(",") };
+  });
+  const truncated = matchLines(lines, /^truncated shown=(\d+) total=(\d+)$/, (m) => ({
+    shown: Number(m[1]),
+    total: Number(m[2]),
+  }))[0];
+  return truncated ? { actors, truncated } : { actors };
 }

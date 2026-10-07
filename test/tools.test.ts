@@ -679,6 +679,187 @@ describe("live state tools", () => {
   });
 });
 
+describe("test-session tools", () => {
+  const cmds = () => bridge!.received.filter((m) => m.t === "cmd").map((m) => m.text ?? "");
+  const withStatus = (opts: LiveOptions = {}) =>
+    live({ ...opts, caps: ["cmd", "event", "time", "status"] });
+
+  it("drills into the nth actor sharing a TID, and needs a tid for index", async () => {
+    const h = await live({ responses: { dumpactor: ["MCP_ACTOR", "class DoomImp", "pitch 5.0"] } });
+    const res = await h.call("actor_state", { tid: 7, index: 2 });
+    expect(res.structuredContent).toMatchObject({ class: "DoomImp", pitch: 5 });
+    expect(cmds().at(-1)).toMatch(/^dumpactor 7 2 /);
+    const bad = await h.call("actor_state", { index: 1 });
+    expect(bad.isError).toBe(true);
+    expect(bad.content?.[0]?.text).toBe("index needs a tid");
+  });
+
+  describe("set_cheat", () => {
+    it("is a no-op when the bit already matches", async () => {
+      const h = await withStatus();
+      bridge!.setStatus({ cheats: String(1 << 1) });
+      bridge!.clearReceived();
+      expect(await h.text("set_cheat", { name: "god", on: true })).toBe("god already on; no change");
+      expect(cmds().some((c) => c.startsWith("god"))).toBe(false);
+      expect(await h.text("set_cheat", { name: "notarget", on: false })).toBe(
+        "notarget already off; no change",
+      );
+    });
+
+    it("toggles once and waits for the bit to flip", async () => {
+      const h = await withStatus();
+      bridge!.onCommand("god", () => bridge!.setStatus({ cheats: "2" }));
+      expect(await h.text("set_cheat", { name: "god", on: true })).toBe("god on");
+      expect(cmds().filter((c) => /^god\b/.test(c))).toHaveLength(1);
+    });
+
+    it("polls until a late flip lands", async () => {
+      const h = await withStatus();
+      let toggled = false;
+      let probesAfter = 0;
+      bridge!.onCommand("noclip2", () => (toggled = true));
+      // An empty match sees every command, bare status probes included.
+      bridge!.onCommand("", () => {
+        if (toggled && ++probesAfter === 4) bridge!.setStatus({ cheats: String(1 << 30) });
+      });
+      expect(await h.text("set_cheat", { name: "noclip2", on: true })).toBe("noclip2 on");
+      expect(probesAfter).toBe(4);
+    });
+
+    it("reports a toggle that never lands, with the engine's own output", async () => {
+      const h = await withStatus({ responses: { buddha: ["sv_cheats must be true"] } });
+      const res = await h.call("set_cheat", { name: "buddha", on: true });
+      expect(res.isError).toBe(true);
+      expect(res.content?.[0]?.text).toBe("buddha did not turn on; the engine said: sv_cheats must be true");
+      const silent = await h.call("set_cheat", { name: "fly", on: true });
+      expect(silent.content?.[0]?.text).toBe("fly did not turn on; the engine said: (no output)");
+    });
+
+    it("refuses when the snapshot has no cheats field", async () => {
+      const h = await withStatus();
+      bridge!.setStatus({ cheats: undefined });
+      const res = await h.call("set_cheat", { name: "god", on: true });
+      expect(res.isError).toBe(true);
+      expect(res.content?.[0]?.text).toMatch(/no cheats= field/);
+    });
+
+    it("refuses on a bridge without the status cap", async () => {
+      const h = await live();
+      const res = await h.call("set_cheat", { name: "god", on: true });
+      expect(res.isError).toBe(true);
+      expect(res.content?.[0]?.text).toMatch(/no status support/);
+    });
+  });
+
+  describe("set_view", () => {
+    it("sets an absolute angle, with and without pitch", async () => {
+      const h = await live({ responses: { mcp_setview: ["view angle=90.0 pitch=-10.0"] } });
+      const res = await h.call("set_view", { angle: 90, pitch: -10.5 });
+      expect(res.structuredContent).toEqual({ angle: 90, pitch: -10 });
+      await h.call("set_view", { angle: 45 });
+      expect(cmds()[0]).toMatch(/^mcp_setview 90 -10\.5 /);
+      expect(cmds()[1]).toMatch(/^mcp_setview 45 /);
+    });
+
+    it("faces an actor by tid or class", async () => {
+      const h = await live({
+        responses: { mcp_setview: ["view angle=12.0 pitch=3.0 tid=0 class=DoomImp"] },
+      });
+      expect(await h.text("set_view", { tid: 5 })).toMatch(/"class":"DoomImp"/);
+      await h.call("set_view", { class: "DoomImp" });
+      expect(cmds()[0]).toMatch(/^mcp_setview tid=5 /);
+      expect(cmds()[1]).toMatch(/^mcp_setview class=DoomImp /);
+    });
+
+    it("rejects zero or several modes, and pitch without angle", async () => {
+      const h = await live();
+      for (const args of [{}, { angle: 1, tid: 2 }, { tid: 1, pitch: 5 }]) {
+        const res = await h.call("set_view", args);
+        expect(res.isError).toBe(true);
+        expect(res.content?.[0]?.text).toMatch(/exactly one of angle, tid or class/);
+      }
+      expect(cmds()).toHaveLength(0);
+    });
+
+    it("surfaces an engine error line, or raw output when there's no view line", async () => {
+      const h = await live({
+        responses: { "tid=9": ["error no actor with tid 9"], "class=Foo": ["Unknown command"] },
+      });
+      expect(await h.text("set_view", { tid: 9 })).toBe("no actor with tid 9");
+      expect(await h.text("set_view", { class: "Foo" })).toBe("Unknown command");
+      expect(await h.text("set_view", { angle: 3 })).toBe("(no output)");
+    });
+  });
+
+  it("lists players", async () => {
+    const h = await live({
+      responses: { dumpplayers: ["MCP_PLAYERS", "player slot=0 bot=0 name=Player", "player slot=1 bot=1 name=Bot"] },
+    });
+    const res = await h.call("list_players");
+    expect(res.content?.[0]?.text).toBe("2 player(s)");
+    expect(res.structuredContent?.players).toEqual([
+      { slot: 0, bot: 0, name: "Player" },
+      { slot: 1, bot: 1, name: "Bot" },
+    ]);
+  });
+
+  it("fails list_players when dumpplayers never ran (no MCP_PLAYERS header)", async () => {
+    const h = await live({ responses: { dumpplayers: ['Unknown command "dumpplayers"'] } });
+    const res = await h.call("list_players");
+    expect(res.isError).toBe(true);
+    expect(res.content?.[0]?.text).toBe('Unknown command "dumpplayers"');
+  });
+
+  describe("find_actors", () => {
+    it("passes only the given filters and reports the count", async () => {
+      const h = await live({ responses: { findactors: ["MCP_FOUND", "found class=DoomImp tid=0 flags=m"] } });
+      expect(await h.text("find_actors")).toBe("1 actor(s) found");
+      await h.call("find_actors", { class: "DoomImp", tid: 3, radius: 100, limit: 5, detail: true });
+      await h.call("find_actors", { detail: false });
+      expect(cmds()[0]).toMatch(/^findactors ;/);
+      expect(cmds()[1]).toMatch(/^findactors class=DoomImp tid=3 radius=100 limit=5 detail=1 /);
+      expect(cmds()[2]).toMatch(/^findactors ;/);
+    });
+
+    it("reports truncation", async () => {
+      const h = await live({
+        responses: { findactors: ["MCP_FOUND", "found class=A tid=0", "truncated shown=1 total=4"] },
+      });
+      const res = await h.call("find_actors", { limit: 1 });
+      expect(res.content?.[0]?.text).toBe("1 actor(s) found (showing 1 of 4)");
+      expect(res.structuredContent?.truncated).toEqual({ shown: 1, total: 4 });
+    });
+
+    it("surfaces an engine error", async () => {
+      const h = await live({ responses: { findactors: ["MCP_FOUND", "error unknown class Nope"] } });
+      const res = await h.call("find_actors", { class: "Nope" });
+      expect(res.isError).toBe(true);
+      expect(res.content?.[0]?.text).toBe("unknown class Nope");
+    });
+
+    it("fails when findactors never ran (no MCP_FOUND header)", async () => {
+      const h = await live({ responses: { findactors: ['Unknown command "findactors"'] } });
+      const res = await h.call("find_actors");
+      expect(res.isError).toBe(true);
+      expect(res.content?.[0]?.text).toBe('Unknown command "findactors"');
+    });
+
+    it("carries each TID match's actor_state index", async () => {
+      const h = await live({
+        responses: { findactors: ["MCP_FOUND", "found class=A tid=7 dist=10.0 index=2", "found class=A tid=7 dist=50.0 index=0"] },
+      });
+      const res = await h.call("find_actors", { tid: 7 });
+      expect((res.structuredContent?.actors as Array<{ index: number }>).map((a) => a.index)).toEqual([2, 0]);
+    });
+
+    it("rejects a class name with spaces", async () => {
+      const h = await live();
+      const res = await h.call("find_actors", { class: "Doom Imp" });
+      expect(res.isError).toBe(true);
+    });
+  });
+});
+
 describe("script listing and profiling tools", () => {
   it("lists scripts and functions", async () => {
     const h = await live({

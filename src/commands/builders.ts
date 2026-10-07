@@ -43,6 +43,11 @@ export function command(verb: string, ...tokens: (string | number)[]): string {
   return [verb, ...parts].join(" ");
 }
 
+/** `key=value` tokens for a CCMD's optional named args, in order; undefined skips one. */
+export function kvArgs(pairs: Record<string, string | number | undefined>): string[] {
+  return Object.entries(pairs).flatMap(([k, v]) => (v !== undefined ? [`${k}=${v}`] : []));
+}
+
 export function buildSave(name: string, description?: string): string {
   // The description may contain spaces, so it is quoted; safeToken still rejects
   // an embedded quote/semicolon/newline so it can't smuggle a second command.

@@ -8,6 +8,7 @@ describe("parseActorState", () => {
     "health 100",
     "pos -3040.0 -3744.0 16.0",
     "angle 178.9",
+    "pitch -10.0",
     "state TNT1 A 0",
     "weapon Pistol",
     "morphtics 0",
@@ -21,6 +22,7 @@ describe("parseActorState", () => {
     expect(a.health).toBe(100);
     expect(a.pos).toEqual({ x: -3040, y: -3744, z: 16 });
     expect(a.angle).toBe(178.9);
+    expect(a.pitch).toBe(-10);
     expect(a.state).toEqual({ sprite: "TNT1", frame: "A", tics: 0 });
     expect(a.weapon).toBe("Pistol");
     expect(a.morphTics).toBe(0);
