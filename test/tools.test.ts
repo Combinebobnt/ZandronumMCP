@@ -800,6 +800,84 @@ describe("test-session tools", () => {
     });
   });
 
+  describe("summon_at", () => {
+    const SPAWNED =
+      "spawned class=DoomImp tid=7 hp=60 spawnhp=60 x=100.0 y=-32.5 z=0.0 angle=90.0 pitch=0.0 flags=mso";
+
+    it("sends only the given options and reports the spawned actor", async () => {
+      const h = await live({ responses: { mcp_spawnat: [SPAWNED] } });
+      const res = await h.call("summon_at", { className: "DoomImp", x: 100, y: -32.5 });
+      expect(res.isError).toBeFalsy();
+      expect(res.structuredContent).toMatchObject({ class: "DoomImp", tid: 7, x: 100, y: -32.5, flags: "monster,shootable,solid" });
+      expect(res.content?.[0]?.text).toBe(
+        "spawned DoomImp tid=7 at 100,-32.5,0; follow up with actor_state(tid 7) / find_actors(class, tid)",
+      );
+      await h.call("summon_at", {
+        className: "DoomImp", x: 1.5, y: 2, z: 64, angle: 45.5, tid: 3, kind: "friend", force: true,
+        health: 5, special: 80, args: [1, 2], ambush: true, dormant: true,
+      });
+      await h.call("summon_at", { className: "DoomImp", x: 0, y: 0, kind: "normal", force: false, ambush: false, dormant: false });
+      await h.call("summon_at", { className: "DoomImp", x: 0, y: 0, kind: "foe" });
+      expect(cmds()[0]).toMatch(/^mcp_spawnat DoomImp 100 -32\.5 ;/);
+      expect(cmds()[1]).toMatch(
+        /^mcp_spawnat DoomImp 1\.5 2 z=64 angle=45\.5 tid=3 kind=friend force=1 health=5 special=80 args=1,2,0,0,0 ambush=1 dormant=1 ;/,
+      );
+      expect(cmds()[2]).toMatch(/^mcp_spawnat DoomImp 0 0 ;/);
+      expect(cmds()[3]).toMatch(/^mcp_spawnat DoomImp 0 0 kind=foe ;/);
+    });
+
+    it("passes tid 0 through and drops the tid follow-up hint", async () => {
+      const h = await live({ responses: { mcp_spawnat: [SPAWNED.replace("tid=7", "tid=0").replace("flags=mso", "flags=-")] } });
+      const res = await h.call("summon_at", { className: "DoomImp", x: 1, y: 2, tid: 0 });
+      expect(cmds()[0]).toMatch(/^mcp_spawnat DoomImp 1 2 tid=0 ;/);
+      expect(res.structuredContent?.flags).toBe("");
+      expect(res.content?.[0]?.text).toMatch(/no tid, so find it with find_actors\(class\) by position$/);
+    });
+
+    it("reports the replacement class and requested name", async () => {
+      const h = await live({ responses: { mcp_spawnat: [SPAWNED.replace("DoomImp", "MyImp") + " requested=DoomImp"] } });
+      const res = await h.call("summon_at", { className: "DoomImp", x: 1, y: 2 });
+      expect(res.structuredContent).toMatchObject({ class: "MyImp", requested: "DoomImp" });
+    });
+
+    it("rejects args without special before sending anything", async () => {
+      const h = await live();
+      const res = await h.call("summon_at", { className: "DoomImp", x: 1, y: 2, args: [1] });
+      expect(res.isError).toBe(true);
+      expect(res.content?.[0]?.text).toBe("args needs special");
+      expect(cmds()).toHaveLength(0);
+    });
+
+    it("refuses coordinates outside the engine's fixed-point range before sending anything", async () => {
+      const h = await live();
+      for (const at of [{ x: 40000, y: 0 }, { x: 0, y: -32769 }, { x: 0, y: 0, z: 32768 }]) {
+        expect((await h.call("summon_at", { className: "DoomImp", ...at })).isError).toBe(true);
+      }
+      expect((await h.call("summon_at", { className: "DoomImp", x: -32768, y: 32767 })).content?.[0]?.text).toBe(
+        "(no output)",
+      );
+      expect(cmds()).toHaveLength(1);
+    });
+
+    it("surfaces each engine error shape, or raw output without a spawned line", async () => {
+      const h = await live({
+        responses: {
+          Nope: ["error unknown class Nope"],
+          "DoomImp 1 ": ["error blocked by player0"],
+          "DoomImp 2 ": ["error client: spawn on the server instance"],
+          "DoomImp 3 ": ["Unknown command"],
+        },
+      });
+      expect(await h.text("summon_at", { className: "Nope", x: 0, y: 0 })).toBe("unknown class Nope");
+      expect(await h.text("summon_at", { className: "DoomImp", x: 1, y: 0 })).toBe("blocked by player0");
+      expect(await h.text("summon_at", { className: "DoomImp", x: 2, y: 0 })).toBe("client: spawn on the server instance");
+      expect(await h.text("summon_at", { className: "DoomImp", x: 3, y: 0 })).toBe("Unknown command");
+      const res = await h.call("summon_at", { className: "DoomImp", x: 4, y: 0 });
+      expect(res.isError).toBe(true);
+      expect(res.content?.[0]?.text).toBe("(no output)");
+    });
+  });
+
   it("lists players", async () => {
     const h = await live({
       responses: { dumpplayers: ["MCP_PLAYERS", "player slot=0 bot=0 name=Player", "player slot=1 bot=1 name=Bot"] },

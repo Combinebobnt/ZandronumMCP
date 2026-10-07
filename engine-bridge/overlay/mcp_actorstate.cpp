@@ -183,7 +183,7 @@ CCMD( mcp_status )
 	Printf( "%s\n", line );
 }
 
-// --- test-session CCMDs: mcp_setview / dumpplayers / findactors -------------
+// --- test-session CCMDs: mcp_setview / dumpplayers / findactors / mcp_spawnat
 // Listing output is "<tag> key=value ..." with name= always last (names can
 // hold spaces), so a caller parses every line with one generic key=value reader.
 
@@ -232,6 +232,24 @@ static const char *MCP_StrArg( FCommandLine &argv, const char *key )
 	for ( int i = 1; i < argv.argc(); i++ )
 		if ( strncmp( argv[i], key, len ) == 0 && argv[i][len] == '=' ) return argv[i] + len + 1;
 	return NULL;
+}
+
+// Parses "key=N" as a fractional number; returns false if the key is absent.
+static bool MCP_NumArg( FCommandLine &argv, const char *key, double &out )
+{
+	const char *v = MCP_StrArg( argv, key );
+	if ( v == NULL ) return false;
+	out = atof( v );
+	return true;
+}
+
+// The field head shared by findactors' found line and mcp_spawnat's spawned line.
+static void MCP_AppendActorKv( FString &line, AActor *a )
+{
+	line.AppendFormat( "class=%s tid=%d hp=%d spawnhp=%d x=%.1f y=%.1f z=%.1f angle=%.1f pitch=%.1f",
+		a->GetClass()->TypeName.GetChars(), a->tid, a->health, a->SpawnHealth(),
+		FIXED2FLOAT( a->x ), FIXED2FLOAT( a->y ), FIXED2FLOAT( a->z ),
+		a->angle / double( ANGLE_1 ), MCP_Deg( a->pitch ) );
 }
 
 // mcp_setview <deg> [pitch] | mcp_setview tid=N | mcp_setview class=X
@@ -414,11 +432,8 @@ CCMD( findactors )
 	for ( unsigned i = 0; i < shown; i++ )
 	{
 		AActor *a = hits[i].actor;
-		FString line;
-		line.Format( "found class=%s tid=%d hp=%d spawnhp=%d x=%.1f y=%.1f z=%.1f angle=%.1f pitch=%.1f",
-			a->GetClass()->TypeName.GetChars(), a->tid, a->health, a->SpawnHealth(),
-			FIXED2FLOAT( a->x ), FIXED2FLOAT( a->y ), FIXED2FLOAT( a->z ),
-			a->angle / double( ANGLE_1 ), MCP_Deg( a->pitch ) );
+		FString line = "found ";
+		MCP_AppendActorKv( line, a );
 		if ( me != NULL ) line.AppendFormat( " dist=%.1f", hits[i].dist );
 		if ( byTid ) line.AppendFormat( " index=%d", hits[i].index );
 		if ( a->state != NULL && a->state->sprite < sprites.Size() )
@@ -440,4 +455,154 @@ CCMD( findactors )
 		Printf( "%s\n", line.GetChars() );
 	}
 	if ( shown < hits.Size() ) Printf( "truncated shown=%u total=%u\n", shown, hits.Size() );
+}
+
+// Strict number parse, so "x=abc" is a usage error rather than a silent 0.
+static bool MCP_ParseNum( const char *s, double &out )
+{
+	char *end;
+	out = strtod( s, &end );
+	return end != s && *end == '\0' && isfinite( out );
+}
+
+// A map coordinate FLOAT2FIXED can hold; 16.16 fixed point wraps outside it.
+static bool MCP_InFixedRange( double v )
+{
+	return v >= -32768.0 && v <= 32767.0;
+}
+
+// Why P_TestMobjLocation refused: an actor, a line, or a floor/ceiling fit.
+static FString MCP_BlockReason( AActor *a )
+{
+	FString s;
+	if ( a->BlockingMobj != NULL ) s.Format( "blocked by %s", MCP_ActorRef( a->BlockingMobj ).GetChars() );
+	else if ( a->BlockingLine != NULL ) s.Format( "blocked by line %d", int( a->BlockingLine - lines ) );
+	else s.Format( "blocked floor=%.1f ceiling=%.1f z=%.1f height=%.1f", FIXED2FLOAT( a->floorz ),
+		FIXED2FLOAT( a->ceilingz ), FIXED2FLOAT( a->z ), FIXED2FLOAT( a->height ) );
+	return s;
+}
+
+// mcp_spawnat <class> <x> <y> [z=N] [angle=N] [tid=N|auto] [kind=friend|foe] [force=1]
+//   [health=N] [special=N] [args=a,b,c,d,e] [ambush=1] [dormant=1]
+// Spawns directly (no net command), so the reply reports the new actor. z defaults
+// to the floor, angle is in degrees, tid defaults to a fresh unique TID.
+CCMD( mcp_spawnat )
+{
+	static const char *const USAGE = "error usage: mcp_spawnat <class> <x> <y> [z=N] [angle=N] "
+		"[tid=N|auto] [kind=friend|foe] [force=1] [health=N] [special=N] [args=a,b,c,d,e] "
+		"[ambush=1] [dormant=1]\n";
+	double x, y, z = 0, angle = 0;
+	if ( argv.argc() < 4 || strchr( argv[1], '=' ) != NULL || !MCP_ParseNum( argv[2], x ) ||
+		!MCP_ParseNum( argv[3], y ) ) { Printf( "%s", USAGE ); return; }
+	if ( NETWORK_InClientMode() ) { Printf( "error client: spawn on the server instance\n" ); return; }
+	if ( gamestate != GS_LEVEL ) { Printf( "error not in a level\n" ); return; }
+
+	const PClass *type = PClass::FindClass( argv[1] );
+	if ( type == NULL || type->ActorInfo == NULL ) { Printf( "error unknown class %s\n", argv[1] ); return; }
+
+	bool hasZ = MCP_NumArg( argv, "z", z );
+	MCP_NumArg( argv, "angle", angle );
+	if ( !MCP_InFixedRange( x ) || !MCP_InFixedRange( y ) || !MCP_InFixedRange( z ) )
+	{
+		Printf( "error coordinates must be within -32768..32767\n" );
+		return;
+	}
+	const char *tidArg = MCP_StrArg( argv, "tid" );
+	const char *kind = MCP_StrArg( argv, "kind" );
+	const char *argsArg = MCP_StrArg( argv, "args" );
+	int force = 0, health = 0, special = 0, ambush = 0, dormant = 0;
+	MCP_IntArg( argv, "force", force );
+	bool hasHealth = MCP_IntArg( argv, "health", health );
+	bool hasSpecial = MCP_IntArg( argv, "special", special );
+	MCP_IntArg( argv, "ambush", ambush );
+	MCP_IntArg( argv, "dormant", dormant );
+	bool friendKind = kind != NULL && strcmp( kind, "friend" ) == 0;
+	bool foeKind = kind != NULL && strcmp( kind, "foe" ) == 0;
+	if ( kind != NULL && !friendKind && !foeKind ) { Printf( "%s", USAGE ); return; }
+
+	int args[5] = { 0, 0, 0, 0, 0 };
+	if ( argsArg != NULL )
+	{
+		const char *p = argsArg;
+		for ( int i = 0; i < 5 && *p != '\0'; i++ )
+		{
+			args[i] = atoi( p );
+			p = strchr( p, ',' );
+			if ( p == NULL ) break;
+			p++;
+		}
+	}
+
+	AActor *actor = Spawn( type, FLOAT2FIXED( x ), FLOAT2FIXED( y ), hasZ ? FLOAT2FIXED( z ) : ONFLOORZ,
+		ALLOW_REPLACE );
+	if ( actor == NULL ) { Printf( "error spawn failed\n" ); return; }
+
+	if ( !force )
+	{
+		DWORD oldFlags2 = actor->flags2;
+		actor->flags2 |= MF2_PASSMOBJ;
+		bool ok = P_TestMobjLocation( actor );
+		actor->flags2 = oldFlags2;
+		if ( !ok )
+		{
+			FString why = MCP_BlockReason( actor );
+			actor->ClearCounters();
+			actor->Destroy();
+			Printf( "error %s\n", why.GetChars() );
+			return;
+		}
+	}
+
+	angle = fmod( angle, 360.0 );
+	if ( angle < 0 ) angle += 360.0;
+	actor->angle = angle_t( angle * double( ANGLE_1 ) );
+	actor->tid = ( tidArg == NULL || strcmp( tidArg, "auto" ) == 0 ) ? P_FindUniqueTID( 0, 0 ) : atoi( tidArg );
+	if ( actor->tid != 0 ) actor->AddToHash();
+	if ( actor->flags & MF_SPECIAL ) actor->flags |= MF_DROPPED;
+
+	if ( friendKind )
+	{
+		if ( actor->CountsAsKill() ) level.total_monsters--;
+		actor->FriendPlayer = consoleplayer + 1;
+		actor->flags |= MF_FRIENDLY;
+		actor->LastHeard = players[consoleplayer].mo;
+		actor->health = actor->SpawnHealth();
+	}
+	else if ( foeKind )
+	{
+		actor->FriendPlayer = 0;
+		actor->flags &= ~MF_FRIENDLY;
+		actor->health = actor->SpawnHealth();
+	}
+	if ( hasHealth ) actor->health = health;
+	if ( hasSpecial )
+	{
+		actor->special = special;
+		for ( int i = 0; i < 5; i++ ) actor->args[i] = args[i];
+	}
+	// Direct writes rather than HandleSpawnFlags, which also resets InitialState.
+	if ( ambush ) actor->flags |= MF_AMBUSH;
+	if ( dormant ) actor->Deactivate( NULL );
+
+	if ( NETWORK_GetState() == NETSTATE_SERVER )
+	{
+		SERVERCOMMANDS_SpawnThing( actor );
+		if ( actor->angle != 0 ) SERVERCOMMANDS_SetThingAngle( actor );
+		if ( actor->tid != 0 ) SERVERCOMMANDS_SetThingTID( actor );
+		if ( kind != NULL || ambush ) SERVERCOMMANDS_SetThingFlags( actor, FLAGSET_FLAGS );
+		if ( kind != NULL || hasHealth ) SERVERCOMMANDS_SetThingHealth( actor );
+		if ( hasSpecial ) { SERVERCOMMANDS_SetThingSpecial( actor ); SERVERCOMMANDS_SetThingArguments( actor ); }
+		if ( dormant ) SERVERCOMMANDS_ThingDeactivate( actor, NULL );
+		SERVER_DestroyActorIfClientsidedOnly( actor );
+	}
+
+	FString line = "spawned ";
+	MCP_AppendActorKv( line, actor );
+	line.AppendFormat( " flags=%s", MCP_FlagLetters( actor ).GetChars() );
+	if ( stricmp( actor->GetClass()->TypeName.GetChars(), argv[1] ) != 0 ) line.AppendFormat( " requested=%s", argv[1] );
+	if ( hasSpecial )
+		line.AppendFormat( " special=%d args=%d,%d,%d,%d,%d", actor->special,
+			actor->args[0], actor->args[1], actor->args[2], actor->args[3], actor->args[4] );
+	if ( force ) line += " forced=1";
+	Printf( "%s\n", line.GetChars() );
 }

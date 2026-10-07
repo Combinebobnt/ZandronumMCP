@@ -13,7 +13,7 @@ import { parseAcsProfile } from "./parsers/acsprofile.js";
 import { cleanConsoleLines } from "./parsers/consoletext.js";
 import { parsePlayerState, parseTarget, withLiveStatus } from "./parsers/playerstate.js";
 import { pollUntil } from "./poll.js";
-import { parseActorState, parseActorsNear, parseFindActors } from "./parsers/actorstate.js";
+import { parseActorState, parseActorsNear, parseFindActors, expandFlags } from "./parsers/actorstate.js";
 import { parsePlayers } from "./parsers/players.js";
 import { parseKvLines, firstError, hasHeader, failureText } from "./parsers/lines.js";
 import { parseHud } from "./parsers/hud.js";
@@ -41,6 +41,8 @@ const acsSrcArg = z.string().optional();
 const acsName = z.string().min(1);
 const mapFileArg = z.string().optional();
 const className = z.string().regex(/^\S+$/, "a class name has no spaces");
+// The engine's 16.16 fixed-point map coordinates wrap outside this range.
+const mapCoord = z.number().min(-32768).max(32767);
 
 /** `set_cheat` names: each is its own stock toggle CCMD, keyed to its `CF_*` bit (d_player.h). */
 const CHEATS = {
@@ -419,7 +421,8 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     "summon",
     {
       title: "Summon actor",
-      description: "Spawn an actor of the given class at the player's position.",
+      description:
+        "Spawn an actor of the given class at the player's position (use summon_at for exact map coordinates).",
       inputSchema: {
         instance: instanceArg,
         className: z.string().min(1),
@@ -431,6 +434,59 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
       const client = await ctx.clientFor(instance);
       const output = await client.runCommand(command(verb, className));
       return { content: [{ type: "text", text: output.join("\n") || `summoned ${className}` }] };
+    },
+  );
+
+  registerLive(
+    "summon_at",
+    {
+      title: "Summon actor at coordinates",
+      description:
+        "Run `mcp_spawnat`: spawn an actor at exact map x/y (each coordinate within -32768..32767; z defaults to the floor, angle in degrees, 0 east) and report it in the same call, even while paused (it thinks once the sim runs). The reply's class is the actual spawned class after any mod replacement (requested= shows the asked-for name when it differs); use it and the returned tid for follow-ups with find_actors/actor_state. tid defaults to a fresh unique TID; tid 0 means none. kind friend/foe matches summonfriend/summonfoe. The spawn is refused, reporting why, for an unknown class or a spot blocked by an actor, a line or the floor/ceiling fit; force skips that check. A point in the void is only caught by the floor/ceiling check here. health, special + args (up to 5, zero-padded), ambush and dormant are set at spawn time. Missile classes spawn inert.",
+      inputSchema: {
+        instance: instanceArg,
+        className,
+        x: mapCoord,
+        y: mapCoord,
+        z: mapCoord.optional(),
+        angle: z.number().finite().optional(),
+        tid: z.number().int().min(0).optional(),
+        kind: z.enum(["normal", "friend", "foe"]).default("normal"),
+        force: z.boolean().optional(),
+        health: z.number().int().min(1).optional(),
+        special: z.number().int().min(0).max(255).optional(),
+        args: z.array(z.number().int()).max(5).optional(),
+        ambush: z.boolean().optional(),
+        dormant: z.boolean().optional(),
+      },
+    },
+    async ({ instance, className: cls, x, y, z: zPos, angle, tid, kind, force, health, special, args, ambush, dormant }) => {
+      if (args !== undefined && special === undefined) {
+        return { isError: true, content: [{ type: "text", text: "args needs special" }] };
+      }
+      const padded = args && [...args, 0, 0, 0, 0, 0].slice(0, 5).join(",");
+      const kv = kvArgs({
+        z: zPos,
+        angle,
+        tid,
+        kind: kind === "normal" ? undefined : kind,
+        force: force ? 1 : undefined,
+        health,
+        special,
+        args: padded,
+        ambush: ambush ? 1 : undefined,
+        dormant: dormant ? 1 : undefined,
+      });
+      const client = await ctx.clientFor(instance);
+      const output = await client.runCommand(command("mcp_spawnat", cls, String(x), String(y), ...kv));
+      const line = parseKvLines(output, "spawned")[0];
+      if (!line) return failed(output);
+      const spawned = expandFlags(line);
+      const hint = spawned.tid
+        ? `; follow up with actor_state(tid ${spawned.tid}) / find_actors(class, tid)`
+        : "; no tid, so find it with find_actors(class) by position";
+      const text = `spawned ${spawned.class} tid=${spawned.tid} at ${spawned.x},${spawned.y},${spawned.z}${hint}`;
+      return { content: [{ type: "text", text }], structuredContent: { ...spawned } };
     },
   );
 

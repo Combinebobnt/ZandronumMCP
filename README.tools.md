@@ -3,14 +3,15 @@
 > **Auto-generated** from `src/tools.ts` by `scripts/gen-tools-doc.mjs` — do not
 > edit by hand; run `npm run docs:tools` to regenerate.
 
-The MCP server exposes **64 tools**. Your agent also discovers them at
+The MCP server exposes **65 tools**. Your agent also discovers them at
 runtime via each tool's `description`, so this is mainly for browsing.
 
 ## Commands, cheats & input
 
 - **`run_command`** — Send a raw console command to a running, bridge-patched Zandronum instance and return its captured output.
 - **`list_actor_classes`** — Run `dumpactors` and return the registered DECORATE/actor classes as structured data.
-- **`summon`** — Spawn an actor of the given class at the player's position.
+- **`summon`** — Spawn an actor of the given class at the player's position (use summon_at for exact map coordinates).
+- **`summon_at`** — Run `mcp_spawnat`: spawn an actor at exact map x/y (each coordinate within -32768..32767; z defaults to the floor, angle in degrees, 0 east) and report it in the same call, even while paused (it thinks once the sim runs). The reply's class is the actual spawned class after any mod replacement (requested= shows the asked-for name when it differs); use it and the returned tid for follow-ups with find_actors/actor_state. tid defaults to a fresh unique TID; tid 0 means none. kind friend/foe matches summonfriend/summonfoe. The spawn is refused, reporting why, for an unknown class or a spot blocked by an actor, a line or the floor/ceiling fit; force skips that check. A point in the void is only caught by the floor/ceiling check here. health, special + args (up to 5, zero-padded), ambush and dormant are set at spawn time. Missile classes spawn inert.
 - **`give`** — Give an inventory item to the player.
 - **`take`** — Remove an inventory item from the player.
 - **`load_map`** — Load a map by its lump name (e.g. MAP01, E1M1).

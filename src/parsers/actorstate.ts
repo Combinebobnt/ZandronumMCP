@@ -122,13 +122,16 @@ export interface FoundActors {
   truncated?: { shown: number; total: number };
 }
 
+/** Expand a record's `flags=` letters into comma-joined names ("-" becomes ""). */
+export function expandFlags(a: KvRecord): KvRecord {
+  if (typeof a.flags !== "string") return a;
+  const flags = [...a.flags].flatMap((c) => (FLAG_LETTERS[c] ? [FLAG_LETTERS[c]] : []));
+  return { ...a, flags: flags.join(",") };
+}
+
 /** Parse `findactors` output, expanding `flags=` letters into names. */
 export function parseFindActors(lines: string[]): FoundActors {
-  const actors = parseKvLines(lines, "found").map((a) => {
-    if (typeof a.flags !== "string") return a;
-    const flags = [...a.flags].flatMap((c) => (FLAG_LETTERS[c] ? [FLAG_LETTERS[c]] : []));
-    return { ...a, flags: flags.join(",") };
-  });
+  const actors = parseKvLines(lines, "found").map(expandFlags);
   const truncated = matchLines(lines, /^truncated shown=(\d+) total=(\d+)$/, (m) => ({
     shown: Number(m[1]),
     total: Number(m[2]),
