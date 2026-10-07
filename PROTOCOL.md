@@ -81,7 +81,7 @@ only when there's a live player actor / an open menu).
 | `demo` / `demorec` | `0`, `1` | playing back / recording a demo |
 | `automap` / `chat` | `0`, `1` | automap open / chat input open |
 | `pending` | `0`, `1` | a map, savegame or demo load (`map`, `load`, `playdemo`) is queued for the next tic, so the other fields still describe the state before it. Other queued actions (screenshot, automap toggle, autosave, level exit) don't count |
-| `maptime` | integer | tics run on the current map (`level.maptime`) |
+| `maptime` | integer | tics run on the current map (`level.maptime`); `ensure_live`/`step_until` watch it move |
 | `health` / `armor` | integers | console player's health and armor amount |
 | `cheats` | integer | console player's `cheats` bits (`CF_GODMODE`, `CF_NOTARGET`, ...), read by `set_cheat` |
 | `menuclass` | class name | the open menu's class |

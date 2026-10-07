@@ -735,6 +735,15 @@ describe("test-session tools", () => {
       expect(silent.content?.[0]?.text).toBe("fly did not turn on; the engine said: (no output)");
     });
 
+    it("fails a toggle whose status snapshot drops the cheats field", async () => {
+      const h = await withStatus();
+      bridge!.onCommand("notarget", () => bridge!.setStatus({ cheats: undefined }));
+      const res = await h.call("set_cheat", { name: "notarget", on: false });
+      expect(res.content?.[0]?.text).toBe("notarget already off; no change");
+      const gone = await h.call("set_cheat", { name: "notarget", on: true });
+      expect(gone.content?.[0]?.text).toBe("notarget did not turn on; the engine said: (no output)");
+    });
+
     it("refuses when the snapshot has no cheats field", async () => {
       const h = await withStatus();
       bridge!.setStatus({ cheats: undefined });
@@ -856,6 +865,234 @@ describe("test-session tools", () => {
       const h = await live();
       const res = await h.call("find_actors", { class: "Doom Imp" });
       expect(res.isError).toBe(true);
+    });
+  });
+
+  /** Empty the fake's status line, so the client's snapshot comes back undefined. */
+  const blankStatus = () => {
+    const keys = ["paused", "menu", "console", "gamestate", "player", "spectating", "demo", "automap"];
+    const more = ["health", "armor", "cheats", "maptime"];
+    bridge!.setStatus(Object.fromEntries([...keys, ...more].map((k) => [k, undefined])));
+  };
+
+  /** Advance the fake's maptime by one on every command, status probes included. */
+  const ticking = () => {
+    let t = 0;
+    bridge!.onCommand("", () => bridge!.setStatus({ maptime: String(++t) }));
+  };
+
+  describe("ensure_live", () => {
+    it("reports live, leaves the pause state as found, and fixes nothing without fix", async () => {
+      const h = await withStatus();
+      bridge!.setStatus({ paused: "1" });
+      ticking();
+      bridge!.clearReceived();
+      const res = await h.call("ensure_live");
+      expect(res.content?.[0]?.text).toBe("live (maptime 1 -> 2)");
+      expect(res.structuredContent).toEqual({ live: true, maptime: { before: 1, after: 2 }, found: [], remaining: [] });
+      expect(bridge!.pauses.slice(-2)).toEqual([0, 1]);
+      expect(cmds().some((c) => /closemenu|mcp_unblock/.test(c))).toBe(false);
+    });
+
+    it("reports a stuck sim with its blockers", async () => {
+      const h = await withStatus();
+      bridge!.setStatus({ menu: "on" });
+      const res = await h.call("ensure_live");
+      expect(res.content?.[0]?.text).toBe("NOT live (maptime 0 -> 0); blockers: a menu is open");
+      expect(res.structuredContent).toMatchObject({ live: false, found: ["a menu is open"] });
+    });
+
+    it("with fix, closes the menu and unblocks, reporting what cleared and what didn't", async () => {
+      const h = await withStatus();
+      bridge!.setStatus({ menu: "on", console: "down", chat: "1", automap: "1" });
+      bridge!.onCommand("closemenu", () => bridge!.setStatus({ menu: "off" }));
+      bridge!.onCommand("mcp_unblock", () => bridge!.setStatus({ console: "up", chat: "0" }));
+      ticking();
+      bridge!.clearReceived();
+      const res = await h.call("ensure_live", { fix: true });
+      expect(res.content?.[0]?.text).toBe(
+        "live (maptime 3 -> 4); fixed: a menu is open, console is down, chat input is open; blockers: automap is open",
+      );
+      expect(res.structuredContent).toMatchObject({
+        fixed: ["a menu is open", "console is down", "chat input is open"],
+        remaining: ["automap is open"],
+      });
+      expect(bridge!.pauses.slice(-1)).toEqual([0]);
+      expect(cmds().filter((c) => /closemenu|mcp_unblock/.test(c))).toHaveLength(2);
+    });
+
+    it("asks for a retry, not a rebuild, when the second status read comes back empty", async () => {
+      const h = await withStatus();
+      bridge!.onCommand("closemenu", blankStatus);
+      const res = await h.call("ensure_live", { fix: true });
+      expect(res.isError).toBe(true);
+      expect(res.content?.[0]?.text).toBe(
+        "can't check liveness: status read timed out (engine busy, e.g. loading a map); retry",
+      );
+    });
+
+    it("lists a load still pending after the wait as a blocker", async () => {
+      const h = await withStatus();
+      bridge!.setStatus({ pending: "1" });
+      const res = await h.call("ensure_live");
+      expect(res.content?.[0]?.text).toBe("NOT live (maptime 0 -> 0); blockers: a map/save/demo load is pending");
+      expect(res.structuredContent).toMatchObject({ found: ["a map/save/demo load is pending"] });
+    });
+
+    it("waits out a pending load before measuring, so the map change doesn't read as not live", async () => {
+      const h = await withStatus();
+      bridge!.setStatus({ maptime: "6" });
+      bridge!.queueStatus({ pending: "1", maptime: "50" }, { pending: "0", maptime: "1" });
+      const res = await h.call("ensure_live");
+      expect(res.content?.[0]?.text).toBe("live (maptime 1 -> 6); waited for a pending map/save/demo load first");
+      expect(res.structuredContent).toMatchObject({ live: true, found: [] });
+    });
+
+    it("needs the time cap and a maptime= field", async () => {
+      const noTime = await live({ caps: ["cmd", "status"] });
+      expect((await noTime.call("ensure_live")).content?.[0]?.text).toMatch(/no time-control/);
+      await harness!.close();
+      await bridge!.close();
+      const noStatus = await live();
+      expect((await noStatus.call("ensure_live")).content?.[0]?.text).toMatch(/no status support/);
+      await harness!.close();
+      await bridge!.close();
+      const old = await withStatus();
+      bridge!.setStatus({ maptime: undefined });
+      expect((await old.call("ensure_live")).content?.[0]?.text).toMatch(/no maptime= field/);
+    });
+  });
+
+  describe("step_until", () => {
+    const mapvar = (op: string, value: number) => ({ kind: "mapvar", name: "hp", op, value });
+
+    it("steps in chunks until a map var meets the condition, counting map tics", async () => {
+      const h = await withStatus();
+      const out = ["mapvar hp = 0"];
+      let n = 0;
+      bridge!.respondTo("getmapvar", out);
+      bridge!.onCommand("getmapvar", () => (out[0] = `mapvar hp = ${++n * 10}`));
+      ticking();
+      bridge!.clearReceived();
+      const res = await h.call("step_until", { condition: mapvar(">=", 30), maxTics: 100 });
+      expect(res.content?.[0]?.text).toBe("met after 2 tic(s): 30 >= 30");
+      expect(res.structuredContent).toEqual({ met: true, tics: 2, value: 30 });
+      expect(bridge!.pauses.slice(-4)).toEqual([0, 1, 0, 1]);
+    });
+
+    it("returns at once when the condition already holds", async () => {
+      const h = await withStatus({ responses: { getacsvar: ["acsvar global 3 = 7"] } });
+      bridge!.clearReceived();
+      const res = await h.call("step_until", {
+        condition: { kind: "acsvar", scope: "global", index: 3, op: "==", value: 7 },
+        maxTics: 10,
+      });
+      expect(res.content?.[0]?.text).toBe("met after 0 tic(s): 7 == 7");
+      expect(bridge!.pauses).toEqual([]);
+    });
+
+    it("stops at maxTics with a short last chunk", async () => {
+      const h = await withStatus({ responses: { getmaparray: ["maparray a[2] = 1"] } });
+      ticking();
+      const res = await h.call("step_until", {
+        condition: { kind: "maparray", name: "a", index: 2, op: "!=", value: 1 },
+        maxTics: 12,
+      });
+      expect(res.content?.[0]?.text).toBe("not met within 3 tic(s): 1 != 1");
+      expect(res.structuredContent).toMatchObject({ met: false });
+      expect(cmds().filter((c) => c.startsWith("getmaparray"))).toHaveLength(4);
+    });
+
+    it("runs only the tics left in the last chunk", async () => {
+      const sleeps: number[] = [];
+      const h = await withStatus({
+        responses: { getmapvar: ["mapvar hp = 0"] },
+        io: { sleep: (ms) => (sleeps.push(ms), Promise.resolve()) },
+      });
+      ticking();
+      sleeps.length = 0;
+      await h.call("step_until", { condition: mapvar("==", 1), maxTics: 12, chunkTics: 5 });
+      expect(sleeps.map((ms) => Math.round((ms * 35) / 1000))).toEqual([5, 5, 2]);
+    });
+
+    it("compares a player field against a number or another field", async () => {
+      const h = await withStatus({
+        responses: {
+          currentpos: [
+            "Current player position: (1.0,2.0,32.0), angle: 90.0, floorheight: 0.0, sector:4, lightlevel: 160",
+          ],
+        },
+      });
+      ticking();
+      const floor = await h.call("step_until", {
+        condition: { kind: "player", field: "z", op: ">", value: "floorHeight" },
+        maxTics: 5,
+      });
+      expect(floor.content?.[0]?.text).toBe("met after 0 tic(s): 32 > 0");
+      const hp = await h.call("step_until", {
+        condition: { kind: "player", field: "health", op: "<", value: 50 },
+        maxTics: 5,
+      });
+      expect(hp.content?.[0]?.text).toBe("not met within 1 tic(s): 100 < 50");
+    });
+
+    it("fails fast when the sim stops advancing, with the blockers", async () => {
+      const h = await withStatus({ responses: { getmapvar: ["mapvar hp = 0"] } });
+      const clean = await h.call("step_until", { condition: mapvar("==", 1), maxTics: 50 });
+      expect(clean.isError).toBe(true);
+      expect(clean.content?.[0]?.text).toBe(
+        "the sim stopped advancing (maptime stuck at 0); no blocker reported. Try ensure_live with fix.",
+      );
+      bridge!.setStatus({ menu: "on" });
+      const blocked = await h.call("step_until", { condition: mapvar("<=", -1), maxTics: 50 });
+      expect(blocked.content?.[0]?.text).toMatch(/stuck at 0\); a menu is open\./);
+    });
+
+    it("treats a snapshot that loses maptime mid-run as a stall", async () => {
+      const h = await withStatus({ responses: { getmapvar: ["mapvar hp = 0"] } });
+      ticking();
+      let reads = 0;
+      bridge!.onCommand("getmapvar", () => ++reads === 2 && bridge!.setStatus({ maptime: undefined }));
+      const res = await h.call("step_until", { condition: mapvar("==", 1), maxTics: 50 });
+      expect(res.content?.[0]?.text).toMatch(/\(maptime unreadable\); no blocker reported/);
+    });
+
+    it("reports reads that can't be made", async () => {
+      const h = await withStatus({
+        responses: { currentpos: ["Current player position: (0.0,0.0,0.0), angle: 0.0, floorheight: 0.0, sector:0, lightlevel: 0"] },
+      });
+      const errText = async (condition: Record<string, unknown>) =>
+        (await h.call("step_until", { condition, maxTics: 5 })).content?.[0]?.text;
+      expect(await errText(mapvar("==", 1))).toBe("map var 'hp' not found");
+      expect(await errText({ kind: "maparray", name: "a", index: 0, op: "==", value: 1 })).toBe(
+        "map array 'a' not found",
+      );
+      expect(await errText({ kind: "acsvar", scope: "world", index: 2, op: "==", value: 1 })).toBe(
+        "world[2] not found",
+      );
+      bridge!.setStatus({ armor: undefined });
+      expect(await errText({ kind: "player", field: "z", op: "==", value: "armor" })).toMatch(/health\/armor/);
+      bridge!.setStatus({ health: undefined });
+      expect(await errText({ kind: "player", field: "health", op: "==", value: 1 })).toMatch(/health\/armor/);
+    });
+
+    it("needs a player, the time cap and a maptime= field", async () => {
+      const h = await withStatus();
+      const noPlayer = await h.call("step_until", {
+        condition: { kind: "player", field: "x", op: "==", value: 0 },
+        maxTics: 5,
+      });
+      expect(noPlayer.content?.[0]?.text).toBe("no player (not in a level?)");
+      bridge!.setStatus({ maptime: undefined });
+      expect((await h.call("step_until", { condition: mapvar("==", 1), maxTics: 5 })).content?.[0]?.text).toMatch(
+        /can't count tics: .*no maptime= field/,
+      );
+      await harness!.close();
+      await bridge!.close();
+      const noTime = await live({ caps: ["cmd", "status"] });
+      expect(
+        (await noTime.call("step_until", { condition: mapvar("==", 1), maxTics: 5 })).content?.[0]?.text,
+      ).toMatch(/no time-control/);
     });
   });
 });

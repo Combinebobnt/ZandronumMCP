@@ -3,7 +3,7 @@
 > **Auto-generated** from `src/tools.ts` by `scripts/gen-tools-doc.mjs` — do not
 > edit by hand; run `npm run docs:tools` to regenerate.
 
-The MCP server exposes **62 tools**. Your agent also discovers them at
+The MCP server exposes **64 tools**. Your agent also discovers them at
 runtime via each tool's `description`, so this is mainly for browsing.
 
 ## Commands, cheats & input
@@ -30,6 +30,8 @@ runtime via each tool's `description`, so this is mainly for browsing.
 
 - **`set_pause`** — Set the engine's master pause flag directly. Use this to resume a backgrounded instance that auto-paused on focus loss, so the simulation keeps advancing while the MCP drives it.
 - **`step`** — Resume the game, let it run for the given number of tics (35 tics = 1 second), then pause again. Lets you advance the simulation a deterministic-ish amount to observe time-based effects (charging, projectiles, animations) without keeping the window focused.
+- **`ensure_live`** — Prove the simulation actually advances: list what could block it (menu, console, chat, automap, not in a level, dead/spectating player, demo, a pending map/save/demo load, which it first waits out for up to ~5 s), then run it ~5 tics and check the map tic counter moved. The pause state is left as found, since `paused` is the normal driving state and `step` runs through it. With fix, first closes the menu (`closemenu`) and hides the console, chat and automap (`mcp_unblock`). Returns live plus the blockers found, fixed and remaining.
+- **`step_until`** — Advance the sim in chunks of chunkTics until a condition holds or maxTics run out, then leave it paused like `step`. The condition compares a map var, map array element, ACS world/global var or player field (x, y, z, angle, floorHeight, sector, light, health, armor) against a number, or a player field against another field (e.g. z == floorHeight). Reports the map tics that actually elapsed. Fails fast with the blocker list if a chunk doesn't advance the map tic counter.
 
 ## ACS world/global variable read/write
 

@@ -9,6 +9,7 @@
 #include "c_console.h"
 #include "actor.h"
 #include "chat.h"
+#include "am_map.h"
 #include "d_event.h"
 #include "d_player.h"
 #include "doomstat.h"
@@ -299,6 +300,16 @@ CCMD( mcp_setview )
 	if ( target != NULL )
 		line.AppendFormat( " tid=%d class=%s", target->tid, target->GetClass()->TypeName.GetChars() );
 	Printf( "%s\n", line.GetChars() );
+}
+
+// Clears what eats input without a stock CCMD to close it: console, chat, automap.
+// The menu has `closemenu`; the pause flag has the bridge's setpause message.
+CCMD( mcp_unblock )
+{
+	C_HideConsole();
+	if ( CHAT_GetChatMode() != CHATMODE_NONE ) CHAT_SetChatMode( CHATMODE_NONE );
+	if ( automapactive ) AM_Stop();
+	Printf( "unblock ok\n" );
 }
 
 CCMD( dumpplayers )

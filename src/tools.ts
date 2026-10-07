@@ -17,7 +17,7 @@ import { parseActorState, parseActorsNear, parseFindActors } from "./parsers/act
 import { parsePlayers } from "./parsers/players.js";
 import { parseKvLines, firstError, hasHeader, failureText } from "./parsers/lines.js";
 import { parseHud } from "./parsers/hud.js";
-import { describeStatus } from "./parsers/status.js";
+import { describeStatus, statusBlockers } from "./parsers/status.js";
 import type { BridgeClient } from "./bridge/transport.js";
 import { findSymbol } from "./acs/symbols.js";
 import { collectAcsLumps, collectAcsModules } from "./acs/collect.js";
@@ -55,6 +55,59 @@ const CHEAT_NAMES = Object.keys(CHEATS) as [keyof typeof CHEATS, ...(keyof typeo
 // A queued cheat lands on the next tic; about 2s of polling covers a busy frame.
 const CHEAT_POLLS = 20;
 const CHEAT_POLL_MS = 100;
+
+// Tics `ensure_live` runs the sim for to see `maptime` move.
+const LIVE_PROBE_TICS = 5;
+// A status read a tool depends on waits out a map load before calling it a timeout.
+const STATUS_READ_MS = 3000;
+
+/** `step_until` comparisons. */
+const COMPARE = {
+  "==": (a: number, b: number) => a === b,
+  "!=": (a: number, b: number) => a !== b,
+  "<": (a: number, b: number) => a < b,
+  "<=": (a: number, b: number) => a <= b,
+  ">": (a: number, b: number) => a > b,
+  ">=": (a: number, b: number) => a >= b,
+} as const;
+const compareOp = z.enum(Object.keys(COMPARE) as [keyof typeof COMPARE, ...(keyof typeof COMPARE)[]]);
+const PLAYER_FIELDS = [
+  "x",
+  "y",
+  "z",
+  "angle",
+  "floorHeight",
+  "sector",
+  "light",
+  "health",
+  "armor",
+] as const;
+const playerField = z.enum(PLAYER_FIELDS);
+const conditionArg = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("mapvar"), name: acsName, op: compareOp, value: z.number() }),
+  z.object({
+    kind: z.literal("maparray"),
+    name: acsName,
+    index: z.number().int().min(0),
+    op: compareOp,
+    value: z.number(),
+  }),
+  z.object({
+    kind: z.literal("acsvar"),
+    scope: acsScope,
+    index: z.number().int().min(0),
+    op: compareOp,
+    value: z.number(),
+  }),
+  z.object({
+    kind: z.literal("player"),
+    field: playerField,
+    op: compareOp,
+    // A second field compares against the same live read, e.g. z == floorHeight.
+    value: z.union([z.number(), playerField]),
+  }),
+]);
+type Condition = z.infer<typeof conditionArg>;
 
 const MENU_KEYS = ["up", "down", "left", "right", "enter", "back", "backspace"] as const;
 
@@ -228,6 +281,13 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
   async function runLoad(client: BridgeClient, cmd: string): Promise<string[]> {
     const out = await client.runCommand(cmd);
     if (!client.supports("status")) return cleanConsoleLines(out);
+    const { settled, printed } = await awaitLoad(client);
+    const caveat = settled ? [] : ["(load still pending after ~5 s; the engine-state note may predate it)"];
+    return [...cleanConsoleLines([...out, ...printed]), ...caveat];
+  }
+
+  /** Poll status until no load is pending (bounded, ~5 s), keeping what the engine printed meanwhile. */
+  async function awaitLoad(client: BridgeClient): Promise<{ settled: boolean; printed: string[] }> {
     const printed: string[] = [];
     // A snapshot with no pending= field (an older overlay) counts as settled.
     const read = async () => {
@@ -239,8 +299,59 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
       waits: LOAD_WAITS,
       wait: () => sleep(LOAD_WAIT_MS),
     });
-    const caveat = settled ? [] : ["(load still pending after ~5 s; the engine-state note may predate it)"];
-    return [...cleanConsoleLines([...out, ...printed]), ...caveat];
+    return { settled, printed };
+  }
+
+  /** Unpause for `tics`, then pause again unless `pauseAfter` is false. */
+  async function runTics(client: BridgeClient, tics: number, pauseAfter = true): Promise<void> {
+    client.setPause(false);
+    await sleep((tics / TICRATE) * 1000);
+    if (pauseAfter) client.setPause(true);
+  }
+
+  /** Why the last status snapshot lacks `field`, or undefined when it has it. */
+  function missingStatus(client: BridgeClient, field: string, hint = ""): string | undefined {
+    if (client.lastStatus?.[field] !== undefined) return undefined;
+    if (!client.supports("status")) return "this engine bridge has no status support (rebuild with the latest bridge)";
+    return client.lastStatus
+      ? `the engine's status snapshot has no ${field}= field (rebuild the engine with the latest overlay)${hint}`
+      : "status read timed out (engine busy, e.g. loading a map); retry";
+  }
+
+  /** `currentpos` plus the health/armor/liveness fields its own sentinel refreshed. */
+  async function readPlayerState(client: BridgeClient) {
+    const parsed = parsePlayerState(await client.runCommand("currentpos"));
+    return parsed ? withLiveStatus(parsed, client.lastStatus) : null;
+  }
+
+  /** Both sides of a `step_until` condition, or why they can't be read. */
+  async function readCondition(
+    client: BridgeClient,
+    c: Condition,
+  ): Promise<{ left: number; right: number } | { error: string }> {
+    if (c.kind === "player") {
+      const state = await readPlayerState(client);
+      if (!state) return { error: "no player (not in a level?)" };
+      const left = state[c.field];
+      const right = typeof c.value === "number" ? c.value : state[c.value];
+      if (left === undefined || right === undefined) {
+        return { error: "health/armor need a bridge with the status cap" };
+      }
+      return { left, right };
+    }
+    let left: number | null;
+    if (c.kind === "mapvar") {
+      left = parseMapVar(await client.runCommand(command("getmapvar", c.name)));
+    } else if (c.kind === "maparray") {
+      left = parseMapArray(await client.runCommand(command("getmaparray", c.name, c.index)));
+    } else {
+      left = parseAcsVars(await client.runCommand(command("getacsvar", c.scope, c.index)))[0]?.value ?? null;
+    }
+    if (left === null) {
+      const what = c.kind === "acsvar" ? `${c.scope}[${c.index}]` : `map ${c.kind === "mapvar" ? "var" : "array"} '${c.name}'`;
+      return { error: `${what} not found` };
+    }
+    return { left, right: c.value };
   }
 
   function postMenuKey(
@@ -698,11 +809,143 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
       if (!client.supports("time")) {
         return { isError: true, content: [{ type: "text", text: NO_TIME_CAP }] };
       }
-      const durationMs = (tics / TICRATE) * 1000;
-      client.setPause(false);
-      await withProgress(extra, durationMs, `advancing ${tics} tic(s)`, () => sleep(durationMs));
-      client.setPause(true);
+      await withProgress(extra, (tics / TICRATE) * 1000, `advancing ${tics} tic(s)`, () =>
+        runTics(client, tics),
+      );
       return { content: [{ type: "text", text: `advanced ~${tics} tic(s)` }] };
+    },
+  );
+
+  registerLive(
+    "ensure_live",
+    {
+      title: "Check that the sim is advancing",
+      description:
+        "Prove the simulation actually advances: list what could block it (menu, console, chat, automap, not in a level, dead/spectating player, demo, a pending map/save/demo load, which it first waits out for up to ~5 s), then run it ~5 tics and check the map tic counter moved. The pause state is left as found, since `paused` is the normal driving state and `step` runs through it. With fix, first closes the menu (`closemenu`) and hides the console, chat and automap (`mcp_unblock`). Returns live plus the blockers found, fixed and remaining.",
+      inputSchema: { instance: instanceArg, fix: z.boolean().default(false) },
+    },
+    async ({ instance, fix }) => {
+      const client = await ctx.clientFor(instance);
+      if (!client.supports("time")) {
+        return { isError: true, content: [{ type: "text", text: NO_TIME_CAP }] };
+      }
+      await client.readStatus(STATUS_READ_MS);
+      // A load finishing mid-probe resets maptime and reads as not live: let it run first.
+      const waited = client.lastStatus?.pending === "1" && (await awaitLoad(client)).settled;
+      const missing = missingStatus(client, "maptime");
+      if (missing) {
+        return { isError: true, content: [{ type: "text", text: `can't check liveness: ${missing}` }] };
+      }
+      const found = statusBlockers(client.lastStatus!);
+      const wasPaused = client.lastStatus!.paused !== "0";
+      if (fix) {
+        await client.runCommand("closemenu");
+        await client.runCommand("mcp_unblock");
+      }
+      // Fresh either way: the refresh above, or the last fix command's own sentinel.
+      const before = Number(client.lastStatus!.maptime);
+      await runTics(client, LIVE_PROBE_TICS, wasPaused);
+      await client.readStatus(STATUS_READ_MS);
+      const lost = missingStatus(client, "maptime");
+      if (lost) {
+        return { isError: true, content: [{ type: "text", text: `can't check liveness: ${lost}` }] };
+      }
+      const after = Number(client.lastStatus!.maptime);
+      const live = after > before;
+      const remaining = statusBlockers(client.lastStatus!);
+      const fixed = fix ? found.filter((b) => !remaining.includes(b)) : undefined;
+      const parts = [
+        live ? `live (maptime ${before} -> ${after})` : `NOT live (maptime ${before} -> ${after})`,
+        ...(waited ? ["waited for a pending map/save/demo load first"] : []),
+        ...(fixed?.length ? [`fixed: ${fixed.join(", ")}`] : []),
+        ...(remaining.length ? [`blockers: ${remaining.join(", ")}`] : []),
+      ];
+      return {
+        content: [{ type: "text", text: parts.join("; ") }],
+        structuredContent: {
+          live,
+          maptime: { before, after },
+          found,
+          ...(fixed ? { fixed } : {}),
+          remaining,
+        },
+      };
+    },
+  );
+
+  registerLive(
+    "step_until",
+    {
+      title: "Step until a condition holds",
+      description:
+        "Advance the sim in chunks of chunkTics until a condition holds or maxTics run out, then leave it paused like `step`. The condition compares a map var, map array element, ACS world/global var or player field (x, y, z, angle, floorHeight, sector, light, health, armor) against a number, or a player field against another field (e.g. z == floorHeight). Reports the map tics that actually elapsed. Fails fast with the blocker list if a chunk doesn't advance the map tic counter.",
+      inputSchema: {
+        instance: instanceArg,
+        condition: conditionArg,
+        maxTics: z.number().int().positive(),
+        chunkTics: z.number().int().positive().default(5),
+      },
+    },
+    async ({ instance, condition, maxTics, chunkTics }, extra) => {
+      const client = await ctx.clientFor(instance);
+      if (!client.supports("time")) {
+        return { isError: true, content: [{ type: "text", text: NO_TIME_CAP }] };
+      }
+      // Every read is a command, whose own sentinel refreshes maptime for free.
+      let prev: number | undefined;
+      let stalled = false;
+      const read = async () => {
+        const got = await readCondition(client, condition);
+        const now = Number(client.lastStatus?.maptime);
+        if (prev !== undefined && !(now > prev)) stalled = true;
+        prev = now;
+        return got;
+      };
+      const first = await read();
+      const missing = missingStatus(client, "maptime");
+      if (missing) {
+        return { isError: true, content: [{ type: "text", text: `can't count tics: ${missing}` }] };
+      }
+      const start = prev!;
+      let stepped = 0;
+      const test = (r: typeof first) => "error" in r || stalled || COMPARE[condition.op](r.left, r.right);
+      const { value } = await withProgress(extra, (maxTics / TICRATE) * 1000, "stepping until condition", () =>
+        pollUntil(() => (stepped === 0 ? first : read()), test, {
+          waits: Math.ceil(maxTics / chunkTics),
+          wait: async () => {
+            const n = Math.min(chunkTics, maxTics - stepped);
+            await runTics(client, n);
+            stepped += n;
+          },
+        }),
+      );
+      if ("error" in value) return { isError: true, content: [{ type: "text", text: value.error }] };
+      const elapsed = prev! - start;
+      if (stalled) {
+        // Only refreshStatus/readStatus clear lastStatus, and nothing here calls them.
+        const blockers = statusBlockers(client.lastStatus!);
+        const why = blockers.length ? blockers.join(", ") : "no blocker reported";
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: `the sim stopped advancing (maptime ${Number.isNaN(prev) ? "unreadable" : `stuck at ${prev}`}); ${why}. Try ensure_live with fix.`,
+            },
+          ],
+        };
+      }
+      const met = COMPARE[condition.op](value.left, value.right);
+      const cmp = `${value.left} ${condition.op} ${value.right}`;
+      return {
+        content: [
+          {
+            type: "text",
+            text: met ? `met after ${elapsed} tic(s): ${cmp}` : `not met within ${elapsed} tic(s): ${cmp}`,
+          },
+        ],
+        structuredContent: { met, tics: elapsed, value: value.left },
+      };
     },
   );
 
@@ -961,13 +1204,10 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
     async ({ instance }) => {
       const client = await ctx.clientFor(instance);
-      const parsed = parsePlayerState(await client.runCommand("currentpos"));
-      if (!parsed) {
+      const state = await readPlayerState(client);
+      if (!state) {
         return { isError: true, content: [{ type: "text", text: "no player (not in a level?)" }] };
       }
-      // Already fresh with zero extra round trips: the `currentpos` command
-      // above just refreshed `lastStatus` via its own sentinel line.
-      const state = withLiveStatus(parsed, client.lastStatus);
       return {
         content: [{ type: "text", text: JSON.stringify(state) }],
         structuredContent: { ...state },
@@ -1097,23 +1337,24 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
         const cheats = client.lastStatus?.cheats;
         return cheats === undefined ? undefined : (Number(cheats) & bit) !== 0;
       };
-      await client.refreshStatus();
-      if (read() === undefined) {
-        const why = client.lastStatus
-          ? "the engine's status snapshot has no cheats= field (rebuild the engine with the latest overlay), or there is no player"
-          : "this engine bridge has no status support (rebuild with the latest bridge)";
-        return { isError: true, content: [{ type: "text", text: `can't read cheat state: ${why}` }] };
+      await client.readStatus(STATUS_READ_MS);
+      const missing = missingStatus(client, "cheats", ", or there is no player");
+      if (missing) {
+        return { isError: true, content: [{ type: "text", text: `can't read cheat state: ${missing}` }] };
       }
       const want = on ? "on" : "off";
       if (read() === on) {
         return { content: [{ type: "text", text: `${name} already ${want}; no change` }] };
       }
       const output = await client.runCommand(name);
-      for (let i = 0; i < CHEAT_POLLS && read() !== on; i++) {
-        await sleep(CHEAT_POLL_MS);
-        await client.refreshStatus();
-      }
-      if (read() !== on) {
+      const { value } = await pollUntil(read, (v) => v === on, {
+        waits: CHEAT_POLLS,
+        wait: async () => {
+          await sleep(CHEAT_POLL_MS);
+          await client.refreshStatus();
+        },
+      });
+      if (value !== on) {
         const said = output.join("\n").trim() || "(no output)";
         return {
           isError: true,

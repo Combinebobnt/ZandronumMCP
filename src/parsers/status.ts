@@ -30,6 +30,8 @@ interface StatusRow {
   /** The value this field takes when nothing unusual is going on. */
   normal: string;
   note: (value: string, status: EngineStatus) => string;
+  /** False for a state that doesn't stop the MCP driving the sim (`step` runs through it). */
+  blocker?: false;
 }
 
 /**
@@ -39,7 +41,7 @@ interface StatusRow {
  * one row, not a new branch.
  */
 const ROWS: StatusRow[] = [
-  { key: "paused", normal: "0", note: () => "paused" },
+  { key: "paused", normal: "0", note: () => "paused", blocker: false },
   {
     key: "menu",
     normal: "off",
@@ -57,9 +59,17 @@ const ROWS: StatusRow[] = [
   { key: "demo", normal: "0", note: () => "playing back a demo" },
   { key: "automap", normal: "0", note: () => "automap is open" },
   { key: "chat", normal: "0", note: () => "chat input is open" },
-  { key: "demorec", normal: "0", note: () => "recording a demo" },
+  { key: "demorec", normal: "0", note: () => "recording a demo", blocker: false },
   { key: "pending", normal: "0", note: () => "a map/save/demo load is pending" },
 ];
+
+function unusualRows(status: EngineStatus): Array<{ row: StatusRow; note: string }> {
+  return ROWS.flatMap((row) => {
+    const value = status[row.key];
+    if (value === undefined || value === row.normal) return [];
+    return [{ row, note: row.note(value, status) }];
+  });
+}
 
 /**
  * Summarise a status snapshot as a short human-readable note, or `undefined`
@@ -67,10 +77,14 @@ const ROWS: StatusRow[] = [
  * costs nothing to read).
  */
 export function describeStatus(status: EngineStatus): string | undefined {
-  const phrases = ROWS.flatMap((row) => {
-    const value = status[row.key];
-    if (value === undefined || value === row.normal) return [];
-    return [row.note(value, status)];
-  });
+  const phrases = unusualRows(status).map((u) => u.note);
   return phrases.length ? `Engine state: ${phrases.join(", ")}.` : undefined;
+}
+
+/** The unusual conditions that can keep a driven sim from advancing or eat its input,
+ *  worded as in `describeStatus`. Leaves out `paused` (the normal driving state) and `demorec`. */
+export function statusBlockers(status: EngineStatus): string[] {
+  return unusualRows(status)
+    .filter((u) => u.row.blocker !== false)
+    .map((u) => u.note);
 }
