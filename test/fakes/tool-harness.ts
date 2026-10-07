@@ -29,7 +29,8 @@ export function stubIo(overrides: Partial<ContextIo> = {}): ContextIo {
       fn();
       return () => {};
     },
-    capture: () => Promise.resolve({ base64: "UE5H" }),
+    capture: (_client, dir, opts) =>
+      Promise.resolve({ base64: "UE5H", path: `${dir}/${opts?.name ?? "mcp_shot"}.png` }),
     findFreePort: (start) => Promise.resolve(start),
     hasBridge: () => true,
     reap: () => Promise.resolve({ found: [], killed: [], survivors: [] }),

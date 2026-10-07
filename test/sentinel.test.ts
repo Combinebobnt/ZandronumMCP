@@ -4,6 +4,7 @@ import {
   statusRequest,
   withSentinel,
   lineContainsSentinel,
+  isSentinelLine,
   stripForeignSentinels,
 } from "../src/correlation/sentinel.js";
 
@@ -31,6 +32,13 @@ describe("sentinel", () => {
   it("detects the sentinel within a console line", () => {
     expect(lineContainsSentinel("__MCPDONE_a1__", "__MCPDONE_a1__")).toBe(true);
     expect(lineContainsSentinel("some other text", "__MCPDONE_a1__")).toBe(false);
+  });
+});
+
+describe("isSentinelLine", () => {
+  it("flags any sentinel echo or mcp_status reply", () => {
+    expect(isSentinelLine("__MCPDONE_x__ paused=1")).toBe(true);
+    expect(isSentinelLine("Degreelessness Mode ON")).toBe(false);
   });
 });
 

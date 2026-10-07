@@ -54,3 +54,25 @@ export function buildBehaviorAcs0Plain(): Buffer {
   buf.writeUInt32LE(8, 4); // dirofs = 8 (< 24) -> no chunks
   return buf;
 }
+
+/** ACSE lump with an MEXP chunk (slot i = exports[i]) and, if given, an ARAY chunk. */
+export function buildBehaviorExports(
+  exports: string[],
+  arrays?: Array<{ index: number; size: number }>,
+): Buffer {
+  const header = Buffer.alloc(8);
+  header.write("ACSE", 0, "latin1");
+  header.writeUInt32LE(8, 4);
+  const parts = [header, nameChunk("MEXP", exports)];
+  if (arrays) {
+    const aray = Buffer.alloc(8 + arrays.length * 8);
+    aray.write("ARAY", 0, "latin1");
+    aray.writeUInt32LE(arrays.length * 8, 4);
+    arrays.forEach((a, i) => {
+      aray.writeUInt32LE(a.index, 8 + i * 8);
+      aray.writeUInt32LE(a.size, 12 + i * 8);
+    });
+    parts.push(aray);
+  }
+  return Buffer.concat(parts);
+}

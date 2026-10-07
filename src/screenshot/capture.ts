@@ -7,6 +7,8 @@ export interface CaptureOptions {
   dir: string;
   /** Base name to use; defaults to a unique generated one. */
   name?: string;
+  /** Leave the PNG on disk instead of deleting it once read. */
+  keep?: boolean;
   /** Max poll attempts for the file to appear. */
   attempts?: number;
   /** Delay between poll attempts, in ms. */
@@ -64,6 +66,10 @@ export async function captureScreenshot(
   const attempts = options.attempts ?? 40;
   const intervalMs = options.intervalMs ?? 100;
 
+  // A kept file from an earlier capture under this name would satisfy the poll
+  // below before the engine writes the new frame.
+  if (options.keep) await io.unlink(path).catch(() => {});
+
   await client.runCommand(`screenshot ${name}`, options.commandTimeoutMs ?? 15000);
 
   for (let i = 0; i < attempts; i++) {
@@ -75,10 +81,12 @@ export async function captureScreenshot(
       continue;
     }
     // Got the file — delete it so screenshots don't pile up, then return.
-    try {
-      await io.unlink(path);
-    } catch {
-      /* best-effort cleanup; ignore if it's already gone */
+    if (!options.keep) {
+      try {
+        await io.unlink(path);
+      } catch {
+        /* best-effort cleanup; ignore if it's already gone */
+      }
     }
     return { name, path, base64: buf.toString("base64") };
   }

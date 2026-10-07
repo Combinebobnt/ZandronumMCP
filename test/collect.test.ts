@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { collectAcsLumps } from "../src/acs/collect.js";
+import { collectAcsLumps, collectAcsModules } from "../src/acs/collect.js";
 import { parseBehaviorNames } from "../src/acs/bytecode.js";
 import { buildWad, buildZip } from "./fakes/wad-builder.js";
 import { buildBehaviorAcse } from "./fakes/acs-builder.js";
@@ -37,5 +37,38 @@ describe("collectAcsLumps", () => {
     expect(names).toContain("libFunc"); // compiled library
     expect(names).toContain("mapFunc"); // map BEHAVIOR inside the inner wad
     expect(lumps).toHaveLength(2);
+  });
+});
+
+describe("collectAcsModules", () => {
+  const lib = buildBehaviorAcse(["f"], []);
+
+  it("names a raw lump by the caller's name, defaulting to BEHAVIOR", () => {
+    expect(collectAcsModules(lib, "lib.o").map((m) => m.name)).toEqual(["lib.o"]);
+    expect(collectAcsModules(lib).map((m) => m.name)).toEqual(["BEHAVIOR"]);
+  });
+
+  it("names map BEHAVIORs by their map marker (binary or UDMF), else BEHAVIOR", () => {
+    const wad = buildWad("PWAD", [
+      { name: "MAP01" },
+      { name: "THINGS" },
+      { name: "BEHAVIOR", data: lib },
+      { name: "MAP02" },
+      { name: "TEXTMAP" },
+      { name: "BEHAVIOR", data: lib },
+      { name: "ENDMAP" },
+    ]);
+    expect(collectAcsModules(wad).map((m) => m.name)).toEqual(["MAP01", "MAP02"]);
+    const bare = buildWad("PWAD", [{ name: "BEHAVIOR", data: lib }]);
+    expect(collectAcsModules(bare).map((m) => m.name)).toEqual(["BEHAVIOR"]);
+  });
+
+  it("prefixes a pk3's map BEHAVIORs with the wad entry and names libraries by entry", () => {
+    const inner = buildWad("PWAD", [{ name: "MAP01" }, { name: "THINGS" }, { name: "BEHAVIOR", data: lib }]);
+    const pk3 = buildZip([
+      { name: "acs/lib.o", data: lib },
+      { name: "maps/MAP01.wad", data: inner },
+    ]);
+    expect(collectAcsModules(pk3).map((m) => m.name)).toEqual(["acs/lib.o", "maps/MAP01.wad:MAP01"]);
   });
 });

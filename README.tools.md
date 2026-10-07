@@ -3,7 +3,7 @@
 > **Auto-generated** from `src/tools.ts` by `scripts/gen-tools-doc.mjs` — do not
 > edit by hand; run `npm run docs:tools` to regenerate.
 
-The MCP server exposes **55 tools**. Your agent also discovers them at
+The MCP server exposes **58 tools**. Your agent also discovers them at
 runtime via each tool's `description`, so this is mainly for browsing.
 
 ## Commands, cheats & input
@@ -17,6 +17,7 @@ runtime via each tool's `description`, so this is mainly for browsing.
 - **`list_running_scripts`** — Run `scriptstat` and return the currently running ACS scripts and their states.
 - **`run_script`** — Run (puke) an ACS script by number or name, with optional integer arguments.
 - **`screenshot`** — Take a screenshot of the game and return it as an image so it can be viewed.
+- **`screenshot_file`** — Take a screenshot and leave it on disk, returning only its absolute path (no image content). For measuring pixels with a script instead of viewing the frame. A reused `name` overwrites that file.
 - **`menu_key`** — Send a single menu navigation key (GUI key event) to the active menu.
 - **`menu_nav`** — Send a sequence of menu keys (e.g. ["down","down","enter"]) with a small delay between each.
 - **`menu_text`** — Type a string into the active menu text-entry field (e.g. the player name box after pressing enter on it), one character at a time.
@@ -41,6 +42,7 @@ runtime via each tool's `description`, so this is mainly for browsing.
 - **`acs_index`** — Parse a directory of .acs source files and return symbol counts (scripts, functions, numeric defines). Reads files directly; no game needed.
 - **`find_acs_symbol`** — Resolve a script number or a script/function name to its symbol(s) — name, number, file:line. Turns a profiler 'script 1017' into a source location.
 - **`behavior_names`** — Read function and named-script names from a mod's compiled ACS (BEHAVIOR/library lumps) in a WAD or PK3 — for source-less mods. Numbered scripts have no names in bytecode (use find_acs_symbol with source for those).
+- **`list_map_exports`** — List each ACS module's exported map variables and arrays (MEXP/ARAY chunks) from a WAD, PK3 or compiled .o, with slot index and array size. get_map_var/get_map_array only see exported names, so check here before a launch or pk3 rebuild. `lump` narrows to modules whose name or basename matches (e.g. `mymod` for `acs/mymod.o`).
 
 ## Savegames & demos
 
@@ -92,4 +94,5 @@ runtime via each tool's `description`, so this is mainly for browsing.
 - **`kill_instance`** — Stop a launched instance and detach from it. Asks the engine to quit itself first (a hard kill mid-render can wedge macOS GPU teardown and leave an unkillable process), then force-kills if it doesn't exit.
 - **`reset`** — Kill every instance this session launched, and reap engines ORPHANED by earlier sessions (whose launcher is gone) that could otherwise squat bridge ports. Engines belonging to another running editor window are left alone. Pass all:true to also kill those — only do that if you know no other session is using this engine build.
 - **`get_startup_errors`** — Read the engine's captured console log for an instance and surface DECORATE/ACS compile errors and fatal startup errors. Works even when the bridge never came up (e.g. the engine aborted on a bad script) — exactly when the other tools can't connect.
+- **`read_log`** — Read an instance's engine console log, which catches prints that never come back in a command reply (e.g. cheat ON/OFF messages, emitted a tic later). Correlation sentinel lines are dropped. `pattern` is a case-insensitive regex filter. Without `sinceLine` this returns the last `maxLines` matches; with it, the first `maxLines` matches after that line. Pass the returned `nextLine` as `sinceLine` to read only what was logged since.
 - **`get_crash`** — Return the signal, faulting address, and symbolized backtrace the bridge's crash handler captured the last time the engine crashed (segfault/abort/bus error/etc.). Use this when an instance dies unexpectedly — e.g. run_command reports the bridge closed. Empty if the instance has not crashed.

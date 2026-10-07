@@ -1,3 +1,5 @@
+import { isSentinelLine } from "../correlation/sentinel.js";
+
 // Pull the actionable errors out of an engine console log (ZANDRONUM_BRIDGE_LOG).
 // The killer case is a DECORATE/ACS compile error or other fatal that aborts the
 // engine during startup, before the bridge socket ever opens — so the only trace
@@ -23,6 +25,44 @@ export function parseStartupErrors(log: string): string[] {
 export function tailLines(log: string, n = 40): string[] {
   const lines = log.split(/\r?\n/).filter((l) => l.trim().length > 0);
   return lines.slice(-n);
+}
+
+export interface LogWindowOptions {
+  /** Case-insensitive filter; only matching lines are returned. */
+  pattern?: string;
+  /** Resume after this raw line count (a previous call's `nextLine`); omitted means tail. */
+  sinceLine?: number;
+  maxLines: number;
+}
+
+export interface LogWindow {
+  /** 1-based raw line numbers, so they line up with the file itself. */
+  lines: Array<{ line: number; text: string }>;
+  /** Pass back as `sinceLine` to read only what was appended after this call. */
+  nextLine: number;
+  /** Matching lines left out by `maxLines`. */
+  omitted: number;
+}
+
+/**
+ * A filtered slice of an engine console log, minus the sentinel plumbing every
+ * tool call writes. Only complete lines count: a half-flushed last line is left
+ * for the next read, so `nextLine` never skips the rest of it.
+ */
+export function readLogWindow(log: string, opts: LogWindowOptions): LogWindow {
+  const raw = log.split(/\r?\n/).slice(0, -1);
+  const rx = opts.pattern === undefined ? undefined : new RegExp(opts.pattern, "i");
+  const matches = raw
+    .map((text, i) => ({ line: i + 1, text: text.trimEnd() }))
+    .slice(opts.sinceLine ?? 0)
+    .filter(({ text }) => text.length > 0 && !isSentinelLine(text) && (!rx || rx.test(text)));
+  const omitted = Math.max(0, matches.length - opts.maxLines);
+  if (opts.sinceLine === undefined) {
+    return { lines: matches.slice(omitted), nextLine: raw.length, omitted };
+  }
+  // Forward read: stop at the cap and resume from the last line returned.
+  const lines = matches.slice(0, opts.maxLines);
+  return { lines, nextLine: omitted ? lines[lines.length - 1].line : raw.length, omitted };
 }
 
 /**

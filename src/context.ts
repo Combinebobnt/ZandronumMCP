@@ -35,7 +35,11 @@ export interface ContextIo {
   sleep: (ms: number) => Promise<void>;
   /** Run `fn` every `ms` until the returned cancel is called. */
   every: (ms: number, fn: () => void) => () => void;
-  capture: (client: BridgeClient, dir: string) => Promise<{ base64: string }>;
+  capture: (
+    client: BridgeClient,
+    dir: string,
+    opts?: { name?: string; keep?: boolean },
+  ) => Promise<{ base64: string; path: string }>;
   findFreePort: (start: number) => Promise<number>;
   hasBridge: (exe: string) => boolean;
   reap: (exe: string, opts?: ReapOptions) => Promise<ReapResult>;
@@ -58,7 +62,7 @@ export const defaultContextIo: ContextIo = {
     timer.unref?.();
     return () => clearInterval(timer);
   },
-  capture: (client, dir) => captureScreenshot(client, { dir }),
+  capture: (client, dir, opts) => captureScreenshot(client, { dir, ...opts }),
   findFreePort: (start) => findFreePort(start),
   hasBridge: (exe) => hasBridge(exe),
   reap: (exe, opts) => reapOrphanEngines(exe, defaultReapIo, opts),

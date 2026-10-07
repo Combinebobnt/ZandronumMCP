@@ -3,7 +3,7 @@ import type { ZodRawShapeCompat } from "@modelcontextprotocol/sdk/server/zod-com
 import { z } from "zod";
 import path from "node:path";
 import type { ServerContext } from "./context.js";
-import { parseStartupErrors, tailLines, crashLogPath } from "./process/startuplog.js";
+import { parseStartupErrors, tailLines, crashLogPath, readLogWindow } from "./process/startuplog.js";
 import { parseDumpActors } from "./parsers/dumpactors.js";
 import { parseScriptStat } from "./parsers/scriptstat.js";
 import { parseAcsVars } from "./parsers/acsvars.js";
@@ -18,8 +18,8 @@ import { parseHud } from "./parsers/hud.js";
 import { describeStatus } from "./parsers/status.js";
 import type { BridgeClient } from "./bridge/transport.js";
 import { findSymbol } from "./acs/symbols.js";
-import { collectAcsLumps } from "./acs/collect.js";
-import { parseBehaviorNames } from "./acs/bytecode.js";
+import { collectAcsLumps, collectAcsModules } from "./acs/collect.js";
+import { parseBehaviorNames, parseMapExports } from "./acs/bytecode.js";
 import { parseRenderInfo, pick } from "./parsers/renderinfo.js";
 import { command, buildPuke, buildPukeName, buildSave } from "./commands/builders.js";
 import { readSaveMeta } from "./saves/png.js";
@@ -419,6 +419,31 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
   );
 
   registerLive(
+    "screenshot_file",
+    {
+      title: "Screenshot to a file",
+      description:
+        "Take a screenshot and leave it on disk, returning only its absolute path (no image content). For measuring pixels with a script instead of viewing the frame. A reused `name` overwrites that file.",
+      inputSchema: {
+        instance: instanceArg,
+        // No spaces or `;`: the name goes unquoted into a console command line.
+        name: z
+          .string()
+          .regex(/^[\w-]+$/, "letters, digits, _ and - only (no extension)")
+          .optional(),
+      },
+    },
+    async ({ instance, name }, extra) => {
+      const client = await ctx.clientFor(instance);
+      const shot = await withProgress(extra, 19000, "capturing screenshot", () =>
+        ctx.io.capture(client, ctx.config.screenshotDir, { name, keep: true }),
+      );
+      const file = path.resolve(shot.path);
+      return { content: [{ type: "text", text: file }], structuredContent: { path: file } };
+    },
+  );
+
+  registerLive(
     "menu_key",
     {
       title: "Press a menu key",
@@ -792,6 +817,39 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
         ],
         structuredContent: result,
       };
+    },
+  );
+
+  server.registerTool(
+    "list_map_exports",
+    {
+      title: "List exported map variables from compiled bytecode",
+      description:
+        "List each ACS module's exported map variables and arrays (MEXP/ARAY chunks) from a WAD, PK3 or compiled .o, with slot index and array size. get_map_var/get_map_array only see exported names, so check here before a launch or pk3 rebuild. `lump` narrows to modules whose name or basename matches (e.g. `mymod` for `acs/mymod.o`).",
+      inputSchema: { file: z.string().min(1), lump: z.string().min(1).optional() },
+    },
+    async ({ file, lump }) => {
+      const all = collectAcsModules(ctx.io.readFileSync(file), path.basename(file));
+      const want = lump?.toLowerCase();
+      const picked = all.filter((m) => {
+        const full = m.name.toLowerCase();
+        return !want || full === want || path.basename(full).replace(/\.[^.]*$/, "") === want;
+      });
+      if (picked.length === 0) {
+        const known = all.map((m) => m.name).join(", ") || "none";
+        return {
+          isError: true,
+          content: [{ type: "text", text: `No ACS module matches "${lump}" in ${file}. Modules: ${known}` }],
+        };
+      }
+      const modules = picked.map((m) => ({ module: m.name, exports: parseMapExports(m.data) }));
+      const text = modules
+        .map(({ module, exports }) => {
+          const rows = exports.map((e) => `  ${e.index}: ${e.name}${e.isArray ? `[${e.size}]` : ""}`);
+          return [`${module}: ${exports.length} export(s)`, ...rows].join("\n");
+        })
+        .join("\n");
+      return { content: [{ type: "text", text }], structuredContent: { modules } };
     },
   );
 
@@ -1557,6 +1615,36 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
         ? `Detected ${errors.length} error line(s) in the engine log:\n\n${errors.join("\n")}`
         : `No compile/fatal errors detected. Last lines of the engine log for context:\n\n${tailLines(log).join("\n")}`;
       return { content: [{ type: "text", text: body }] };
+    },
+  );
+
+  server.registerTool(
+    "read_log",
+    {
+      title: "Read the engine console log",
+      description:
+        "Read an instance's engine console log, which catches prints that never come back in a command reply (e.g. cheat ON/OFF messages, emitted a tic later). Correlation sentinel lines are dropped. `pattern` is a case-insensitive regex filter. Without `sinceLine` this returns the last `maxLines` matches; with it, the first `maxLines` matches after that line. Pass the returned `nextLine` as `sinceLine` to read only what was logged since.",
+      inputSchema: {
+        instance: instanceArg,
+        pattern: z.string().min(1).optional(),
+        sinceLine: z.number().int().nonnegative().optional(),
+        maxLines: z.number().int().positive().default(200),
+      },
+    },
+    async ({ instance, pattern, sinceLine, maxLines }) => {
+      const logFile = ctx.logPathFor(instance);
+      if (!logFile || !ctx.io.existsSync(logFile)) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: `No engine log for instance ${instance}. Launch it via launch_instance, which enables logging.` }],
+        };
+      }
+      const win = readLogWindow(ctx.io.readTextSync(logFile), { pattern, sinceLine, maxLines });
+      const head =
+        `${win.lines.length} line(s), nextLine=${win.nextLine}` +
+        (win.omitted ? `, ${win.omitted} more matching line(s) not shown` : "");
+      const text = [head, ...win.lines.map((l) => `${l.line}: ${l.text}`)].join("\n");
+      return { content: [{ type: "text", text }], structuredContent: { ...win } };
     },
   );
 

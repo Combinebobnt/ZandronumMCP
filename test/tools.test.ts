@@ -4,8 +4,8 @@ import { startHarness, collectTools, type Harness } from "./fakes/tool-harness.j
 import { FakeBridge } from "./fakes/fake-bridge.js";
 import { InstanceRegistry } from "./../src/process/registry.js";
 import type { ContextIo, ServerConfig } from "../src/context.js";
-import { buildWad, sectorsLump, doomLinedefsLump, sidedefsLump, vertexesLump } from "./fakes/wad-builder.js";
-import { buildBehaviorAcse } from "./fakes/acs-builder.js";
+import { buildWad, buildZip, sectorsLump, doomLinedefsLump, sidedefsLump, vertexesLump } from "./fakes/wad-builder.js";
+import { buildBehaviorAcse, buildBehaviorExports } from "./fakes/acs-builder.js";
 
 /**
  * Drives every registered tool through a real MCP client/server pair — the
@@ -164,6 +164,33 @@ describe("console, cheat and script tools", () => {
     const h = await live();
     const result = await h.call("screenshot");
     expect(result.content?.[0]).toMatchObject({ type: "image", mimeType: "image/png", data: "UE5H" });
+  });
+
+  it("saves a kept screenshot and returns only its absolute path", async () => {
+    const seen: Array<{ name?: string; keep?: boolean } | undefined> = [];
+    const h = await live({
+      config: { screenshotDir: "/shots" },
+      io: {
+        capture: (_c, dir, opts) => {
+          seen.push(opts);
+          return Promise.resolve({ base64: "UE5H", path: `${dir}/${opts?.name ?? "auto"}.png` });
+        },
+      },
+    });
+    const named = await h.call("screenshot_file", { name: "wall_1" });
+    expect(named.content?.[0]).toEqual({ type: "text", text: "/shots/wall_1.png" });
+    expect(named.structuredContent).toEqual({ path: "/shots/wall_1.png" });
+    expect(await h.text("screenshot_file")).toBe("/shots/auto.png");
+    expect(seen).toEqual([
+      { name: "wall_1", keep: true },
+      { name: undefined, keep: true },
+    ]);
+  });
+
+  it("rejects a screenshot name that would break the console command line", async () => {
+    const h = await live();
+    expect((await h.call("screenshot_file", { name: "a b" })).isError).toBe(true);
+    expect((await h.call("screenshot_file", { name: "x;quit" })).isError).toBe(true);
   });
 });
 
@@ -436,6 +463,55 @@ describe("ACS source and bytecode tools", () => {
     expect(result.structuredContent).toEqual({
       functions: ["GiveCredits"],
       namedScripts: ["OpenDoor"],
+    });
+  });
+
+  describe("list_map_exports", () => {
+    const pk3 = buildZip([
+      { name: "acs/mymod.o", data: buildBehaviorExports(["credits", "round"], [{ index: 0, size: 17 }]) },
+      { name: "acs/other.o", data: buildBehaviorExports(["x"]) },
+    ]);
+
+    it("lists every module's exports, arrays sized", async () => {
+      const h = await offline({}, { readFileSync: () => pk3 });
+      const result = await h.call("list_map_exports", { file: "/mods/x.pk3" });
+      expect(result.content?.[0]?.text).toBe(
+        "acs/mymod.o: 2 export(s)\n  0: credits[17]\n  1: round\nacs/other.o: 1 export(s)\n  0: x",
+      );
+      expect(result.structuredContent?.modules).toHaveLength(2);
+    });
+
+    it("narrows to one module by basename or full name", async () => {
+      const h = await offline({}, { readFileSync: () => pk3 });
+      const byBase = await h.call("list_map_exports", { file: "/mods/x.pk3", lump: "MyMod" });
+      expect(byBase.structuredContent?.modules).toEqual([
+        {
+          module: "acs/mymod.o",
+          exports: [
+            { name: "credits", index: 0, isArray: true, size: 17 },
+            { name: "round", index: 1, isArray: false },
+          ],
+        },
+      ]);
+      const byFull = await h.call("list_map_exports", { file: "/mods/x.pk3", lump: "acs/other.o" });
+      expect(byFull.content?.[0]?.text).toBe("acs/other.o: 1 export(s)\n  0: x");
+    });
+
+    it("names a raw compiled file after itself", async () => {
+      const h = await offline({}, { readFileSync: () => buildBehaviorExports(["v"]) });
+      expect(await h.text("list_map_exports", { file: "/build/lib.o" })).toBe("lib.o: 1 export(s)\n  0: v");
+    });
+
+    it("errors with the available module names when lump matches nothing", async () => {
+      const h = await offline({}, { readFileSync: () => pk3 });
+      const result = await h.call("list_map_exports", { file: "/mods/x.pk3", lump: "nope" });
+      expect(result.isError).toBe(true);
+      expect(result.content?.[0]?.text).toMatch(/Modules: acs\/mymod\.o, acs\/other\.o$/);
+    });
+
+    it("says so when the file has no ACS modules at all", async () => {
+      const h = await offline({}, { readFileSync: () => buildZip([{ name: "decorate.txt", data: Buffer.from("x") }]) });
+      expect(await h.text("list_map_exports", { file: "/e.pk3", lump: "a" })).toMatch(/Modules: none$/);
     });
   });
 });
@@ -895,6 +971,28 @@ describe("diagnostic tools", () => {
       { existsSync: () => true, readTextSync: () => "all quiet\n" },
     );
     expect(await h.text("get_startup_errors")).toMatch(/Last lines of the engine log[\s\S]*all quiet/);
+  });
+
+  it("read_log reports when there is no engine log", async () => {
+    const result = await (await offline()).call("read_log");
+    expect(result.isError).toBe(true);
+    expect(result.content?.[0]?.text).toMatch(/No engine log for instance 1/);
+  });
+
+  it("read_log returns numbered lines without sentinels, with a resume point", async () => {
+    const h = await offline(
+      { exe: "/engine/zandronum" },
+      { existsSync: () => true, readTextSync: () => "a\n__MCPDONE_1__\nGod ON\nb\n" },
+    );
+    const all = await h.call("read_log", { maxLines: 2 });
+    expect(all.content?.[0]?.text).toBe("2 line(s), nextLine=4, 1 more matching line(s) not shown\n3: God ON\n4: b");
+    expect(all.structuredContent).toMatchObject({ nextLine: 4, omitted: 1 });
+    expect(await h.text("read_log", { pattern: "god", sinceLine: 1 })).toBe("1 line(s), nextLine=4\n3: God ON");
+  });
+
+  it("read_log surfaces an invalid pattern as a tool error", async () => {
+    const h = await offline({ exe: "/engine/zandronum" }, { existsSync: () => true, readTextSync: () => "a\n" });
+    expect((await h.call("read_log", { pattern: "(" })).isError).toBe(true);
   });
 
   it("reports no crash when there is no crash file", async () => {

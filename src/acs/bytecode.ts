@@ -9,6 +9,8 @@ const MAGIC_ACSE = 0x45534341; // "ACSE"
 const MAGIC_ACSe = 0x65534341; // "ACSe"
 const ID_FNAM = 0x4d414e46; // "FNAM"
 const ID_SNAM = 0x4d414e53; // "SNAM"
+const ID_MEXP = 0x5058454d; // "MEXP"
+const ID_ARAY = 0x59415241; // "ARAY"
 
 export interface BytecodeNames {
   functions: string[];
@@ -70,4 +72,38 @@ export function parseBehaviorNames(lump: Buffer): BytecodeNames {
     functions: fnam >= 0 ? readNameChunk(lump, fnam) : [],
     namedScripts: snam >= 0 ? readNameChunk(lump, snam) : [],
   };
+}
+
+export interface MapExport {
+  name: string;
+  /** Map variable slot; MEXP entry i names slot i (FindMapVarName, p_acs.cpp). */
+  index: number;
+  isArray: boolean;
+  /** Element count, for arrays only. */
+  size?: number;
+}
+
+/**
+ * Exported map variables and arrays: the only names get_map_var/get_map_array can
+ * see. MEXP is a name chunk; ARAY is [slot][size] pairs (p_acs.cpp, "Create arrays").
+ */
+export function parseMapExports(lump: Buffer): MapExport[] {
+  const region = locateChunks(lump);
+  if (!region) return [];
+  const mexp = findChunk(lump, region, ID_MEXP);
+  if (mexp < 0) return [];
+  const sizes = new Map<number, number>();
+  const aray = findChunk(lump, region, ID_ARAY);
+  if (aray >= 0) {
+    // A corrupt size can't read past the lump (readUInt32LE throws there).
+    const count = Math.floor(Math.min(lump.readUInt32LE(aray + 4), lump.length - aray - 8) / 8);
+    for (let i = 0; i < count; i++) {
+      sizes.set(lump.readUInt32LE(aray + 8 + i * 8), lump.readUInt32LE(aray + 12 + i * 8));
+    }
+  }
+  return readNameChunk(lump, mexp).flatMap((name, index) => {
+    if (!name) return [];
+    const size = sizes.get(index);
+    return [size === undefined ? { name, index, isArray: false } : { name, index, isArray: true, size }];
+  });
 }

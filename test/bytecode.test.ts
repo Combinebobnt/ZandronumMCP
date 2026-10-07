@@ -1,9 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { parseBehaviorNames } from "../src/acs/bytecode.js";
+import { parseBehaviorNames, parseMapExports } from "../src/acs/bytecode.js";
 import {
   buildBehaviorAcse,
   buildBehaviorAcs0Enhanced,
   buildBehaviorAcs0Plain,
+  buildBehaviorExports,
 } from "./fakes/acs-builder.js";
 
 describe("parseBehaviorNames", () => {
@@ -44,5 +45,30 @@ describe("parseBehaviorNames", () => {
   it("returns empty for non-ACS or too-short buffers", () => {
     expect(parseBehaviorNames(Buffer.from("PWAD"))).toEqual({ functions: [], namedScripts: [] });
     expect(parseBehaviorNames(Buffer.alloc(2))).toEqual({ functions: [], namedScripts: [] });
+  });
+});
+
+describe("parseMapExports", () => {
+  it("names each exported slot and sizes the ones ARAY marks as arrays", () => {
+    const lump = buildBehaviorExports(["credits", "", "round"], [{ index: 0, size: 17 }]);
+    expect(parseMapExports(lump)).toEqual([
+      { name: "credits", index: 0, isArray: true, size: 17 },
+      { name: "round", index: 2, isArray: false },
+    ]);
+  });
+
+  it("treats every export as a scalar when there is no ARAY chunk", () => {
+    expect(parseMapExports(buildBehaviorExports(["a"]))).toEqual([{ name: "a", index: 0, isArray: false }]);
+  });
+
+  it("returns empty without an MEXP chunk or chunked bytecode", () => {
+    expect(parseMapExports(buildBehaviorAcse(["f"], []))).toEqual([]);
+    expect(parseMapExports(buildBehaviorAcs0Plain())).toEqual([]);
+  });
+
+  it("reads only the ARAY pairs actually present when its size overstates them", () => {
+    const lump = buildBehaviorExports(["credits"], [{ index: 0, size: 17 }]);
+    lump.writeUInt32LE(0xffff, lump.indexOf("ARAY") + 4);
+    expect(parseMapExports(lump)).toEqual([{ name: "credits", index: 0, isArray: true, size: 17 }]);
   });
 });

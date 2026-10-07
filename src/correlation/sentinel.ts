@@ -29,6 +29,11 @@ export function withSentinel(command: string, sentinel: string, status: boolean)
   return `${command} ; ${status ? statusRequest(sentinel) : `echo ${sentinel}`}`;
 }
 
+/** Whether a log line is correlation plumbing (any sentinel echo or `mcp_status` reply). */
+export function isSentinelLine(line: string): boolean {
+  return line.includes(SENTINEL_PREFIX);
+}
+
 export function lineContainsSentinel(line: string, sentinel: string): boolean {
   return line.includes(sentinel);
 }

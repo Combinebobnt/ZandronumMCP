@@ -95,6 +95,32 @@ describe("captureScreenshot", () => {
     ).rejects.toThrow(/did not appear/);
   });
 
+  it("keeps the file, clearing any stale one of the same name first", async () => {
+    const unlinked: string[] = [];
+    let ran = false;
+    const client = {
+      runCommand: async () => {
+        ran = true;
+        return [];
+      },
+    } as unknown as BridgeClient;
+    const io: CaptureIo = {
+      readFile: async () => {
+        if (!ran) throw new Error("read before the command ran");
+        return Buffer.from("NEW");
+      },
+      unlink: async (p) => {
+        expect(ran).toBe(false); // only the pre-capture clear, never after the read
+        unlinked.push(p);
+        throw new Error("ENOENT"); // nothing stale there: tolerated
+      },
+      sleep: async () => {},
+    };
+    const shot = await captureScreenshot(client, { dir: "/d", name: "k", keep: true }, io);
+    expect(shot.base64).toBe(Buffer.from("NEW").toString("base64"));
+    expect(unlinked).toEqual(["/d/k.png"]);
+  });
+
   it("reads then deletes a real file via the default IO", async () => {
     const dir = freshDir();
     const path = join(dir, "late.png");
