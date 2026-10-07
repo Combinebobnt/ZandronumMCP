@@ -104,6 +104,38 @@ the only thing Gatekeeper gates. A self-built engine is never quarantined, so th
 only affects downloads. (For a no-friction download you'd sign with a Developer ID
 and notarize the app in CI — not wired up here.)
 
+## ACS compilers for `run_acs`
+
+`run_acs` compiles its snippet on the host before loading it into the game, so it needs
+[zt-bcc](https://github.com/zeta-group/zt-bcc) (the default) or
+[acc](https://github.com/ZDoom/acc) (`compiler: "acc"`) installed. Nothing else needs a
+compiler: without one, the server and every other tool work as usual, and `run_acs` returns
+an error naming what to install and which variable to set, without touching the game.
+
+The server looks for `zt-bcc`, then `bcc`, on `PATH` (and `acc` for acc). To use a binary
+that isn't on `PATH`, set its path in the MCP env:
+
+```json
+"env": { "ZANDRONUM_EXE": "...", "ZANDRONUM_BCC": "/path/to/zt-bcc", "ZANDRONUM_ACC": "/path/to/acc" }
+```
+
+`#include "zcommon.acs"` needs zt-bcc's `lib/` folder. zt-bcc finds a `lib/` next to its
+own binary when it's started by full path, which the server always does, and the server
+also adds a `lib/` one folder up (a binary in a source checkout's `build/`), following
+symlinks to the real binary. Otherwise pass the folder in the call's `includeDirs`.
+Relative `includeDirs` and `ZANDRONUM_BCC`/`ZANDRONUM_ACC` paths are resolved against the
+server's working directory; a bare name there (no folder) is looked up on `PATH`.
+
+On Windows the server only runs `.exe` files: a `.cmd` or `.bat` wrapper can't be used.
+
+acc usually finds `zcommon.acs` in its own install; if it doesn't, pass its folder in
+`includeDirs` the same way.
+
+The compiled snippet goes in the system temp folder. On Windows the game can't open it there
+if that path has non-ASCII characters (a user folder like `C:\Users\José`). If `run_acs`
+refuses its temp folder, set `TEMP` in the MCP env to an existing plain-ASCII folder, e.g.
+`"TEMP": "C:\\mcp-temp"` (`TMPDIR` on Linux and macOS).
+
 ## Run the server from source
 
 Instead of the published `npx` package, you can point your client at a local build:

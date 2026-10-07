@@ -3,7 +3,7 @@
 > **Auto-generated** from `src/tools.ts` by `scripts/gen-tools-doc.mjs` — do not
 > edit by hand; run `npm run docs:tools` to regenerate.
 
-The MCP server exposes **65 tools**. Your agent also discovers them at
+The MCP server exposes **66 tools**. Your agent also discovers them at
 runtime via each tool's `description`, so this is mainly for browsing.
 
 ## Commands, cheats & input
@@ -17,6 +17,7 @@ runtime via each tool's `description`, so this is mainly for browsing.
 - **`load_map`** — Load a map by its lump name (e.g. MAP01, E1M1).
 - **`list_running_scripts`** — Run `scriptstat` and return the currently running ACS scripts and their states.
 - **`run_script`** — Run (puke) an ACS script by number or name, with optional integer arguments.
+- **`run_acs`** — Compile full ACS source host-side (bcc by default: zt-bcc or bcc on PATH, with zt-bcc's lib/ found next to or one folder above the binary; or acc on PATH; ZANDRONUM_BCC/ZANDRONUM_ACC override the executables) and load it into the running level as a temporary module, then optionally run one of its scripts by number or name with up to 4 args. The script runs inside this call until its first delay, so its Log() output comes back in the reply (Print() is a HUD message: use read_hud); stepTics then runs the sim that many tics and returns the log lines printed meanwhile. A snippet that isn't a #library is compiled as one, so its strings resolve. It may #import a library the level already loaded (pass includeDirs for its source) and then shares that library's live functions and map vars; importing a library that isn't loaded is refused before anything is sent. open runs its OPEN scripts. Compile errors come back without touching the engine. Offline only (no server/client). Zandronum can't unload a module: one the engine rejects stays loaded, inert, and every snippet stays until the map changes. While any is loaded save_game refuses: a save would fail to load (in-game saves and leaving a hub level carry the same hazard, which this tool can't intercept).
 - **`screenshot`** — Take a screenshot of the game and return it as an image so it can be viewed.
 - **`screenshot_file`** — Take a screenshot and leave it on disk, returning only its absolute path (no image content). For measuring pixels with a script instead of viewing the frame. A reused `name` overwrites that file.
 - **`menu_key`** — Send a single menu navigation key (GUI key event) to the active menu.

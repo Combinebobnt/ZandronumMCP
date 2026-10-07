@@ -61,6 +61,13 @@ const ROWS: StatusRow[] = [
   { key: "chat", normal: "0", note: () => "chat input is open" },
   { key: "demorec", normal: "0", note: () => "recording a demo", blocker: false },
   { key: "pending", normal: "0", note: () => "a map/save/demo load is pending" },
+  // run_acs snippet modules in the level, which make a save unloadable.
+  {
+    key: "acstemp",
+    normal: "0",
+    note: (v) => `${v} run_acs snippet module(s) loaded (saves refused until the map changes)`,
+    blocker: false,
+  },
 ];
 
 function unusualRows(status: EngineStatus): Array<{ row: StatusRow; note: string }> {
@@ -82,7 +89,8 @@ export function describeStatus(status: EngineStatus): string | undefined {
 }
 
 /** The unusual conditions that can keep a driven sim from advancing or eat its input,
- *  worded as in `describeStatus`. Leaves out `paused` (the normal driving state) and `demorec`. */
+ *  worded as in `describeStatus`. Leaves out `paused` (the normal driving state), `demorec`
+ *  and `acstemp`. */
 export function statusBlockers(status: EngineStatus): string[] {
   return unusualRows(status)
     .filter((u) => u.row.blocker !== false)

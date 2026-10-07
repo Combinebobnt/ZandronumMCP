@@ -11,6 +11,7 @@ const ID_FNAM = 0x4d414e46; // "FNAM"
 const ID_SNAM = 0x4d414e53; // "SNAM"
 const ID_MEXP = 0x5058454d; // "MEXP"
 const ID_ARAY = 0x59415241; // "ARAY"
+const ID_LOAD = 0x44414f4c; // "LOAD"
 
 export interface BytecodeNames {
   functions: string[];
@@ -72,6 +73,25 @@ export function parseBehaviorNames(lump: Buffer): BytecodeNames {
     functions: fnam >= 0 ? readNameChunk(lump, fnam) : [],
     namedScripts: snam >= 0 ? readNameChunk(lump, snam) : [],
   };
+}
+
+/** Whether a buffer is loadable ACS bytecode at all (FBehavior's magic + 32-byte floor). */
+export function isAcsObject(lump: Buffer): boolean {
+  return lump.length >= 32 && lump.toString("latin1", 0, 3) === "ACS" && [0, 0x45, 0x65].includes(lump[3]);
+}
+
+/**
+ * Libraries an object imports: the LOAD chunk, NUL-separated names (p_acs.cpp,
+ * "Load required libraries"). The engine looks each up as an ACS library lump,
+ * so these match `dumpmodules` names case-insensitively.
+ */
+export function parseLoadNames(lump: Buffer): string[] {
+  const region = locateChunks(lump);
+  if (!region) return [];
+  const load = findChunk(lump, region, ID_LOAD);
+  if (load < 0) return [];
+  const size = lump.readUInt32LE(load + 4);
+  return lump.toString("latin1", load + 8, load + 8 + size).split("\0").filter((n) => n.length > 0);
 }
 
 export interface MapExport {

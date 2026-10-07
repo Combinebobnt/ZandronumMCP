@@ -278,6 +278,10 @@ describe("defaultContextIo", () => {
     });
     expect(ticks).toBe(2);
     expect(defaultContextIo.hasBridge(here)).toBe(false);
+    const built = defaultContextIo.compileAcs({ compiler: "bcc", exe: "/no/such/bcc", source: "x" });
+    expect(built).toMatchObject({ ok: false, diagnostics: "compiler /no/such/bcc (set by ZANDRONUM_BCC) not found." });
+    defaultContextIo.removeDir(built.dir);
+    expect(defaultContextIo.existsSync(built.dir)).toBe(false);
     expect(typeof defaultContextIo.launchIo.spawn).toBe("function");
   });
 

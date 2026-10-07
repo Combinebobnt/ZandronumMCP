@@ -5,6 +5,7 @@ import { findFreePort } from "./process/launch.js";
 import { reapOrphanEngines, defaultIo as defaultReapIo, type ReapResult, type ReapOptions } from "./process/reap.js";
 import { hasBridge } from "./process/verify.js";
 import { buildIndex, type AcsIndex } from "./acs/symbols.js";
+import { compileAcs, removeDir, type CompileRequest, type CompileResult } from "./acs/compile.js";
 import { readMapFromContainer, type MapData } from "./map/index.js";
 import { captureScreenshot } from "./screenshot/capture.js";
 import type { BridgeClient } from "./bridge/transport.js";
@@ -19,6 +20,9 @@ export interface ServerConfig {
   iwad?: string;
   acsSrc?: string;
   saveDir?: string;
+  /** `run_acs` compilers; default to `zt-bcc`/`bcc` or `acc` on PATH. */
+  bcc?: string;
+  acc?: string;
 }
 
 /**
@@ -44,6 +48,8 @@ export interface ContextIo {
   hasBridge: (exe: string) => boolean;
   reap: (exe: string, opts?: ReapOptions) => Promise<ReapResult>;
   launchIo: LaunchIo;
+  compileAcs: (req: CompileRequest) => CompileResult;
+  removeDir: (dir: string) => void;
 }
 
 export const defaultContextIo: ContextIo = {
@@ -67,6 +73,8 @@ export const defaultContextIo: ContextIo = {
   hasBridge: (exe) => hasBridge(exe),
   reap: (exe, opts) => reapOrphanEngines(exe, defaultReapIo, opts),
   launchIo: defaultLaunchIo,
+  compileAcs: (req) => compileAcs(req),
+  removeDir: (dir) => removeDir(dir),
 };
 
 /**

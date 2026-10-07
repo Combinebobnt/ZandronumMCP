@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { parseBehaviorNames, parseMapExports } from "../src/acs/bytecode.js";
+import { readFileSync } from "node:fs";
+import { parseBehaviorNames, parseMapExports, isAcsObject, parseLoadNames } from "../src/acs/bytecode.js";
 import {
   buildBehaviorAcse,
   buildBehaviorAcs0Enhanced,
@@ -70,5 +71,29 @@ describe("parseMapExports", () => {
     const lump = buildBehaviorExports(["credits"], [{ index: 0, size: 17 }]);
     lump.writeUInt32LE(0xffff, lump.indexOf("ARAY") + 4);
     expect(parseMapExports(lump)).toEqual([{ name: "credits", index: 0, isArray: true, size: 17 }]);
+  });
+});
+
+describe("isAcsObject / parseLoadNames", () => {
+  // Real zt-bcc output: a #library snippet that #imports "mcplib".
+  const imp = readFileSync(new URL("./fixtures/runacs-import.o", import.meta.url));
+
+  it("reads a real object's LOAD chunk", () => {
+    expect(isAcsObject(imp)).toBe(true);
+    expect(parseLoadNames(imp)).toEqual(["mcplib"]);
+  });
+
+  it("finds no imports without a LOAD chunk or chunk region", () => {
+    expect(parseLoadNames(buildBehaviorAcse(["f"], []))).toEqual([]);
+    expect(parseLoadNames(buildBehaviorAcs0Plain())).toEqual([]);
+  });
+
+  it("rejects anything the engine's magic check would", () => {
+    expect(isAcsObject(Buffer.from("script 1 (void) {}  padding to 32 bytes"))).toBe(false);
+    expect(isAcsObject(Buffer.from("ACS"))).toBe(false);
+    const bad = Buffer.from(imp);
+    bad[3] = 0x58;
+    expect(isAcsObject(bad)).toBe(false);
+    expect(isAcsObject(buildBehaviorAcse([], []))).toBe(true);
   });
 });

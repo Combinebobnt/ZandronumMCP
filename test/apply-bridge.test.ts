@@ -166,6 +166,7 @@ describe("applyBridge", () => {
     expect(pacs).toContain("MCP_ACSVARS");
     expect(pacs).toContain("MCP_MAPVARS");
     expect(pacs).toContain("MCP_SCRIPTS");
+    expect(pacs).toContain("MCP_RUNACS");
     expect(readFileSync(join(src, "CMakeLists.txt"), "utf8")).toContain("target_sources( zdoom PRIVATE mcp_bridge.cpp");
   });
 

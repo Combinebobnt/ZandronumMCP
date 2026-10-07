@@ -6,6 +6,7 @@ import { InstanceRegistry } from "./../src/process/registry.js";
 import type { ContextIo, ServerConfig } from "../src/context.js";
 import { buildWad, buildZip, sectorsLump, doomLinedefsLump, sidedefsLump, vertexesLump } from "./fakes/wad-builder.js";
 import { buildBehaviorAcse, buildBehaviorExports } from "./fakes/acs-builder.js";
+import { readFileSync } from "node:fs";
 
 /**
  * Drives every registered tool through a real MCP client/server pair — the
@@ -1774,5 +1775,194 @@ describe("engine-state note (registerLive)", () => {
     const result = await h.call("menu_key", { key: "down" });
     expect(result.content).toHaveLength(1);
     expect(cmdsSent()).toHaveLength(0);
+  });
+});
+
+describe("run_acs", () => {
+  const cmds = () => bridge!.received.filter((m) => m.t === "cmd").map((m) => m.text ?? "");
+  const REPLY = "MCP_RUNACS module=2 scripts=3 started=1 deferred=0";
+  const OBJECT = buildBehaviorAcse([], []);
+  const IMPORTING = readFileSync(new URL("./fixtures/runacs-import.o", import.meta.url));
+
+  /** A compileAcs stub that records its requests and the dirs removed after. */
+  function compiler(result: { ok: true; token?: string } | { ok: false; diagnostics: string; exe?: string } = { ok: true }) {
+    const requests: unknown[] = [];
+    const removed: string[] = [];
+    const io: Partial<ContextIo> = {
+      compileAcs: (req) => {
+        requests.push(req);
+        const object = "/tmp/mcp-runacs-1/snippet.o";
+        return result.ok
+          ? { ok: true, dir: "/tmp/mcp-runacs-1", object, token: result.token ?? object }
+          : { ok: false, dir: "/tmp/mcp-runacs-1", diagnostics: result.diagnostics, exe: result.exe };
+      },
+      removeDir: (dir) => void removed.push(dir),
+      readFileSync: () => OBJECT,
+    };
+    return { io, requests, removed };
+  }
+
+  it("compiles with bcc, loads, runs and reports the script's own output", async () => {
+    const c = compiler();
+    const h = await live({ responses: { mcp_runacs: ["runacs ok", "", REPLY] }, io: c.io });
+    const res = await h.call("run_acs", { source: "script 1 (void) {}", script: 1, args: [5, -2] });
+    expect(res.isError).toBeFalsy();
+    expect(c.requests).toEqual([{ compiler: "bcc", exe: undefined, source: "script 1 (void) {}", includeDirs: undefined }]);
+    expect(c.removed).toEqual(["/tmp/mcp-runacs-1"]);
+    expect(cmds()[0]).toMatch(/^mcp_runacs \/tmp\/mcp-runacs-1\/snippet\.o 1 5 -2 ;/);
+    const text = res.content?.[0]?.text ?? "";
+    expect(text).toMatch(/^loaded snippet as module 2 \(3 script\(s\)\), started 1\nrunacs ok\nsave_game refuses/);
+    expect(text).not.toMatch(/DEATH/);
+    expect(res.structuredContent).toEqual({ module: 2, scripts: 3, started: "1", deferred: false, output: ["runacs ok"] });
+  });
+
+  it("uses the configured acc, include dirs, a named script and open, and warns about deferred scripts", async () => {
+    const c = compiler();
+    const h = await live({
+      responses: { mcp_runacs: ["MCP_RUNACS module=0 scripts=2 started=named deferred=1"] },
+      io: c.io,
+      config: { acc: "/opt/acc", bcc: "/opt/bcc" },
+    });
+    const res = await h.call("run_acs", { source: "x", script: "named", compiler: "acc", includeDirs: ["/mod/scripts"], open: true });
+    expect(c.requests[0]).toMatchObject({ compiler: "acc", exe: "/opt/acc", includeDirs: ["/mod/scripts"] });
+    expect(cmds()[0]).toMatch(/^mcp_runacs \/tmp\/mcp-runacs-1\/snippet\.o named open=1 ;/);
+    expect(res.content?.[0]?.text).toMatch(/DEATH\/ENTER\/RESPAWN/);
+    await h.call("run_acs", { source: "x", open: false });
+    expect(cmds()[1]).toMatch(/^mcp_runacs \/tmp\/mcp-runacs-1\/snippet\.o ;/);
+    await h.call("run_acs", { source: "x" });
+    expect(c.requests[2]).toMatchObject({ exe: "/opt/bcc" });
+  });
+
+  it("sends the object as compileAcs's console token, quoted if it has to be", async () => {
+    const c = compiler({ ok: true, token: '"C:/Users/First Last/Temp/mcp-runacs-1/snippet.o"' });
+    const h = await live({ responses: { mcp_runacs: [REPLY] }, io: c.io });
+    const res = await h.call("run_acs", { source: "x", script: 1 });
+    expect(res.isError).toBeFalsy();
+    expect(cmds()[0]).toMatch(/^mcp_runacs "C:\/Users\/First Last\/Temp\/mcp-runacs-1\/snippet\.o" 1 ;/);
+  });
+
+  it("treats a blank configured compiler as unset", async () => {
+    const c = compiler();
+    const h = await live({ responses: { mcp_runacs: [REPLY] }, io: c.io, config: { bcc: "  " } });
+    await h.call("run_acs", { source: "x" });
+    expect(c.requests[0]).toMatchObject({ exe: undefined });
+  });
+
+  it("returns compile diagnostics without sending anything, and still cleans up", async () => {
+    const c = compiler({ ok: false, diagnostics: "snippet.acs:1:30: syntax error" });
+    const h = await live({ io: c.io });
+    const res = await h.call("run_acs", { source: "x", script: 1 });
+    expect(res.isError).toBe(true);
+    expect(res.content?.[0]?.text).toBe("compile failed (bcc), nothing sent to the engine:\nsnippet.acs:1:30: syntax error");
+    expect(cmds()).toHaveLength(0);
+    expect(c.removed).toEqual(["/tmp/mcp-runacs-1"]);
+    const named = await live({ io: compiler({ ok: false, diagnostics: "boom", exe: "/usr/bin/bcc" }).io });
+    expect((await named.call("run_acs", { source: "x" })).content?.[0]?.text).toBe(
+      "compile failed (bcc: /usr/bin/bcc), nothing sent to the engine:\nboom",
+    );
+  });
+
+  it("refuses args without a script, or stepTics without the time cap, before compiling", async () => {
+    const c = compiler();
+    const h = await live({ io: c.io, caps: ["cmd"] });
+    expect(await h.text("run_acs", { source: "x", args: [1] })).toBe("args needs script");
+    expect(await h.text("run_acs", { source: "x", stepTics: 3 })).toMatch(/no time-control support/);
+    expect(c.requests).toHaveLength(0);
+  });
+
+  it("surfaces the engine's refusal with everything it printed", async () => {
+    const c = compiler();
+    const h = await live({
+      responses: {
+        "snippet.o 1": ["Could not find ACS function Foo for use in BEHAVIOR.", "error bad module (unresolved import or import mismatch)"],
+        "snippet.o 2": [],
+      },
+      io: c.io,
+    });
+    const res = await h.call("run_acs", { source: "x", script: 1 });
+    expect(res.isError).toBe(true);
+    expect(res.content?.[0]?.text).toBe(
+      "Could not find ACS function Foo for use in BEHAVIOR.\nerror bad module (unresolved import or import mismatch)",
+    );
+    expect(await h.text("run_acs", { source: "x", script: 2 })).toBe("(no output)");
+  });
+
+  it("steps the sim and returns the log lines printed meanwhile", async () => {
+    let reads = 0;
+    const logs = ["a\nb\n", "a\nb\nafter delay\n"];
+    const c = compiler();
+    const h = await live({
+      responses: { mcp_runacs: ["before delay", REPLY] },
+      config: { exe: "/engine/zandronum" },
+      io: { ...c.io, existsSync: () => true, readTextSync: () => logs[Math.min(reads++, 1)] },
+    });
+    const res = await h.call("run_acs", { source: "x", script: 2, stepTics: 2 });
+    await settle(() => bridge!.pauses.length === 2);
+    expect(bridge!.pauses).toEqual([0, 1]);
+    expect(res.content?.[0]?.text).toMatch(/\nbefore delay\nlog after 2 tic\(s\):\nafter delay\n/);
+    expect(res.structuredContent?.log).toEqual(["after delay"]);
+  });
+
+  it("says so when there is no engine log to read after stepping", async () => {
+    const c = compiler();
+    const h = await live({ responses: { mcp_runacs: [REPLY] }, io: c.io });
+    const res = await h.call("run_acs", { source: "x", script: 1, stepTics: 1 });
+    expect(res.content?.[0]?.text).toMatch(/ran 1 tic\(s\); no engine log to read/);
+    expect(res.structuredContent?.log).toBeUndefined();
+  });
+
+  it("makes save_game refuse while a snippet module is loaded", async () => {
+    const h = await live({ caps: ["cmd", "event", "time", "status"] });
+    bridge!.setStatus({ acstemp: "2" });
+    const res = await h.call("save_game", { name: "s1" });
+    expect(res.isError).toBe(true);
+    expect(res.content?.[0]?.text).toMatch(/^refused: 2 run_acs snippet module\(s\) are loaded/);
+    expect(cmds().some((t) => t.startsWith("save "))).toBe(false);
+    bridge!.setStatus({ acstemp: "0" });
+    bridge!.respondTo("save s1", ["Game saved."]);
+    expect((await h.call("save_game", { name: "s1" })).isError).toBe(false);
+    expect(cmds().some((t) => /^mcp_status ;/.test(t))).toBe(false);
+  });
+
+  it("makes save_game refuse when the status read comes back empty", async () => {
+    const h = await live({ caps: ["cmd", "event", "time", "status"] });
+    // Every field blank: the status line is a bare sentinel, which parses to no snapshot.
+    const keys = ["paused", "menu", "console", "gamestate", "player", "spectating", "demo", "automap"];
+    keys.push("health", "armor", "cheats", "maptime");
+    bridge!.setStatus(Object.fromEntries(keys.map((k) => [k, undefined])));
+    const res = await h.call("save_game", { name: "s1" });
+    expect(res.isError).toBe(true);
+    expect(res.content?.[0]?.text).toMatch(/^refused: status read timed out/);
+    expect(cmds().some((t) => t.startsWith("save "))).toBe(false);
+  });
+
+  it("sends a snippet whose imports are all loaded", async () => {
+    const c = compiler();
+    const h = await live({
+      responses: { dumpmodules: ["MCP_MODULES", "module 0 MCPLIB"], mcp_runacs: [REPLY] },
+      io: { ...c.io, readFileSync: () => IMPORTING },
+    });
+    expect((await h.call("run_acs", { source: "x", script: 1 })).isError).toBeFalsy();
+    expect(cmds().filter((t) => t.startsWith("mcp_runacs"))).toHaveLength(1);
+  });
+
+  it("refuses an import that isn't loaded before sending anything (Zandronum can't unload it)", async () => {
+    const c = compiler();
+    const h = await live({
+      responses: { dumpmodules: ["MCP_MODULES", "module 0 OTHER"] },
+      io: { ...c.io, readFileSync: () => IMPORTING },
+    });
+    expect(await h.text("run_acs", { source: "x", script: 1 })).toBe(
+      "imports mcplib, not loaded in this level; nothing sent to the engine",
+    );
+    expect(cmds().some((t) => t.startsWith("mcp_runacs"))).toBe(false);
+    expect(c.removed).toEqual(["/tmp/mcp-runacs-1"]);
+  });
+
+  it("refuses compiler output that isn't an ACS object", async () => {
+    const c = compiler();
+    const h = await live({ io: { ...c.io, readFileSync: () => Buffer.from("not bytecode") } });
+    expect(await h.text("run_acs", { source: "x" })).toBe("bcc produced no ACS object; nothing sent to the engine");
+    expect(cmds()).toHaveLength(0);
   });
 });

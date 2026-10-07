@@ -21,9 +21,10 @@ import { describeStatus, statusBlockers } from "./parsers/status.js";
 import type { BridgeClient } from "./bridge/transport.js";
 import { findSymbol } from "./acs/symbols.js";
 import { collectAcsLumps, collectAcsModules } from "./acs/collect.js";
-import { parseBehaviorNames, parseMapExports } from "./acs/bytecode.js";
+import { parseBehaviorNames, parseMapExports, isAcsObject, parseLoadNames } from "./acs/bytecode.js";
+import { parseRunAcs } from "./parsers/runacs.js";
 import { parseRenderInfo, pick } from "./parsers/renderinfo.js";
-import { command, kvArgs, buildPuke, buildPukeName, buildSave } from "./commands/builders.js";
+import { command, kvArgs, buildPuke, buildPukeName, buildRunAcs, buildSave } from "./commands/builders.js";
 import { readSaveMeta } from "./saves/png.js";
 import {
   menuKeyEvent,
@@ -588,6 +589,93 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
         typeof script === "number" ? buildPuke(script, args) : buildPukeName(script, args, always);
       const output = await client.runCommand(cmd);
       return { content: [{ type: "text", text: output.join("\n") || `ran ${script}` }] };
+    },
+  );
+
+  registerLive(
+    "run_acs",
+    {
+      title: "Hot-load and run an ACS snippet",
+      description:
+        "Compile full ACS source host-side (bcc by default: zt-bcc or bcc on PATH, with zt-bcc's lib/ found next to or one folder above the binary; or acc on PATH; ZANDRONUM_BCC/ZANDRONUM_ACC override the executables) and load it into the running level as a temporary module, then optionally run one of its scripts by number or name with up to 4 args. The script runs inside this call until its first delay, so its Log() output comes back in the reply (Print() is a HUD message: use read_hud); stepTics then runs the sim that many tics and returns the log lines printed meanwhile. A snippet that isn't a #library is compiled as one, so its strings resolve. It may #import a library the level already loaded (pass includeDirs for its source) and then shares that library's live functions and map vars; importing a library that isn't loaded is refused before anything is sent. open runs its OPEN scripts. Compile errors come back without touching the engine. Offline only (no server/client). Zandronum can't unload a module: one the engine rejects stays loaded, inert, and every snippet stays until the map changes. While any is loaded save_game refuses: a save would fail to load (in-game saves and leaving a hub level carry the same hazard, which this tool can't intercept).",
+      inputSchema: {
+        instance: instanceArg,
+        source: z.string().min(1),
+        script: z.union([z.number().int(), z.string().regex(/^[^\s;"]+$/, "a script name has no spaces")]).optional(),
+        args: z.array(z.number().int()).max(4).optional(),
+        compiler: z.enum(["bcc", "acc"]).default("bcc"),
+        includeDirs: z
+          .array(z.string().min(1))
+          .optional()
+          .describe("Absolute paths; a relative one resolves against the MCP server's working directory."),
+        open: z.boolean().optional(),
+        stepTics: z.number().int().min(0).default(0),
+      },
+    },
+    async ({ instance, source, script, args, compiler, includeDirs, open, stepTics }, extra) => {
+      const fail = (text: string) => ({ isError: true, content: [{ type: "text" as const, text }] });
+      if (args !== undefined && script === undefined) return fail("args needs script");
+      const client = await ctx.clientFor(instance);
+      if (stepTics > 0 && !client.supports("time")) return fail(NO_TIME_CAP);
+      // A blank env var means unset, so PATH is searched.
+      const exe = ctx.config[compiler]?.trim() || undefined;
+      const built = ctx.io.compileAcs({ compiler, exe, source, includeDirs });
+      let output: string[];
+      try {
+        if (!built.ok) return fail(`compile failed (${built.exe === undefined ? compiler : `${compiler}: ${built.exe}`}), nothing sent to the engine:\n${built.diagnostics}`);
+        // The engine can't unload a module it rejects, so catch what we can first.
+        const obj = ctx.io.readFileSync(built.object);
+        if (!isAcsObject(obj)) return fail(`${compiler} produced no ACS object; nothing sent to the engine`);
+        const imports = parseLoadNames(obj);
+        if (imports.length > 0) {
+          const loaded = new Set(parseModules(await client.runCommand("dumpmodules")).map((m) => m.name.toUpperCase()));
+          const missing = imports.filter((n) => !loaded.has(n.slice(0, 8).toUpperCase()));
+          if (missing.length > 0) {
+            return fail(`imports ${missing.join(", ")}, not loaded in this level; nothing sent to the engine`);
+          }
+        }
+        const run = script === undefined ? [] : [script, ...(args ?? [])];
+        output = await client.runCommand(buildRunAcs(built.token, ...run, ...(open ? ["open=1"] : [])));
+      } finally {
+        ctx.io.removeDir(built.dir);
+      }
+      const reply = parseRunAcs(output);
+      if (!reply) return fail(output.join("\n").trim() || "(no output)");
+      const printed = output
+        .join("\n")
+        .split(/\r?\n/)
+        .map((l) => l.trimEnd())
+        .filter((l) => l.length > 0 && !l.startsWith("MCP_RUNACS "));
+
+      let later: string[] | undefined;
+      if (stepTics > 0) {
+        const logFile = ctx.logPathFor(instance);
+        const readLog = (sinceLine?: number) =>
+          logFile && ctx.io.existsSync(logFile)
+            ? readLogWindow(ctx.io.readTextSync(logFile), { sinceLine, maxLines: 200 })
+            : undefined;
+        const since = readLog()?.nextLine;
+        await withProgress(extra, (stepTics / TICRATE) * 1000, `advancing ${stepTics} tic(s)`, () =>
+          runTics(client, stepTics),
+        );
+        later = since === undefined ? undefined : readLog(since)?.lines.map((l) => l.text);
+      }
+
+      const lines = [
+        `loaded snippet as module ${reply.module} (${reply.scripts} script(s)), started ${reply.started}`,
+        ...printed,
+      ];
+      if (stepTics > 0) {
+        lines.push(later ? `log after ${stepTics} tic(s):` : `ran ${stepTics} tic(s); no engine log to read`, ...(later ?? []));
+      }
+      if (reply.deferred) {
+        lines.push("The snippet has DEATH/ENTER/RESPAWN/... scripts: they fire on later events until the map changes.");
+      }
+      lines.push("save_game refuses until the map changes (a save now could not be loaded back); in-game saves and hub exits carry the same hazard.");
+      return {
+        content: [{ type: "text", text: lines.join("\n") }],
+        structuredContent: { ...reply, output: printed, ...(later ? { log: later } : {}) },
+      };
     },
   );
 
@@ -1210,6 +1298,32 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
     async ({ instance, name, description }) => {
       const client = await ctx.clientFor(instance);
+      // A run_acs module in the level makes the save unloadable (module-count I_Error).
+      // An exact read, so no bare MCP_STATUS line reaches the log; a timeout fails closed.
+      const { status } = await client.readStatus(STATUS_READ_MS);
+      if (client.supports("status") && status === undefined) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: "refused: status read timed out (engine busy, e.g. loading a map), so loaded run_acs snippets can't be ruled out; retry",
+            },
+          ],
+        };
+      }
+      const temp = status?.acstemp;
+      if (temp !== undefined && temp !== "0") {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: `refused: ${temp} run_acs snippet module(s) are loaded, and loading a save taken now fails (ACS module count mismatch). Change or reload the map (load_map) first.`,
+            },
+          ],
+        };
+      }
       const out = (await client.runCommand(buildSave(name, description))).join("\n");
       // `save` only queues the write (G_SaveGame sets sendsave), so "Game saved." prints a
       // tic after this reply; every rejection prints in-call.

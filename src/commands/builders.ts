@@ -37,10 +37,13 @@ function nonNegative(n: number): number {
   return n;
 }
 
+function token(t: string | number): string {
+  return typeof t === "number" ? intToken(t) : safeToken(t);
+}
+
 /** Join a verb and tokens into one validated console command string. */
 export function command(verb: string, ...tokens: (string | number)[]): string {
-  const parts = tokens.map((t) => (typeof t === "number" ? intToken(t) : safeToken(t)));
-  return [verb, ...parts].join(" ");
+  return [verb, ...tokens.map(token)].join(" ");
 }
 
 /** `key=value` tokens for a CCMD's optional named args, in order; undefined skips one. */
@@ -54,6 +57,12 @@ export function buildSave(name: string, description?: string): string {
   const parts = ["save", safeToken(name)];
   if (description !== undefined) parts.push(`"${safeToken(description)}"`);
   return parts.join(" ");
+}
+
+export function buildRunAcs(object: string, ...tokens: (string | number)[]): string {
+  // `object` comes from consolePath and may be quoted; its inside still gets the shared check.
+  safeToken(object.replace(/^"(.*)"$/, "$1"));
+  return ["mcp_runacs", object, ...tokens.map(token)].join(" ");
 }
 
 export function buildPuke(script: number, args: number[] = []): string {

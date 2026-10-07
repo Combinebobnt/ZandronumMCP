@@ -210,6 +210,7 @@ export function applyBridge({ src, revert = false, overlayDir, log = () => {} })
   appendOnce(pacs, "MCP_ACSVARS", readFileSync(join(overlayDir, "mcp_acsvars.inc"), "utf8"), "ACS var CCMDs appended", log);
   appendOnce(pacs, "MCP_MAPVARS", readFileSync(join(overlayDir, "mcp_mapvars.inc"), "utf8"), "map var CCMDs appended", log);
   appendOnce(pacs, "MCP_SCRIPTS", readFileSync(join(overlayDir, "mcp_scripts.inc"), "utf8"), "script/function CCMDs appended", log);
+  appendOnce(pacs, "MCP_RUNACS", readFileSync(join(overlayDir, "mcp_runacs.inc"), "utf8"), "run_acs CCMD appended", log);
 
   // 4. CMakeLists.txt -- compile the overlay into the zdoom target.
   const cmakeEol = detectEol(readFileSync(cmake, "utf8"));

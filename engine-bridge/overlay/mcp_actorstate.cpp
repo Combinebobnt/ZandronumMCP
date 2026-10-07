@@ -19,6 +19,7 @@
 #include "r_data/sprites.h"
 #include "m_fixed.h"
 #include "tables.h"
+#include "p_acs.h"
 #include "g_level.h"
 #include "r_utility.h"
 #include "v_text.h"
@@ -111,6 +112,18 @@ static bool MCP_LoadPending( )
 	}
 }
 
+// Temp modules mcp_runacs loaded into the current level (LumpNum <= -2, see
+// mcp_runacs.inc). Nonzero means a save would I_Error on load.
+static int MCP_RunAcsModules()
+{
+	int n = 0;
+	for ( int lib = 0; FBehavior *m = FBehavior::StaticGetModule( lib ); lib++ )
+	{
+		if ( m->GetLumpNum() <= -2 ) n++;
+	}
+	return n;
+}
+
 // One-line engine state snapshot, so an MCP caller can tell a normally-running
 // game apart from paused/menu/console/intermission/dead/spectating/chatting/
 // demo-recording states that would otherwise make an unrelated tool (summon,
@@ -152,7 +165,7 @@ CCMD( mcp_status )
 	char line[512];
 	size_t n = (size_t)snprintf( line, sizeof( line ),
 		"%s paused=%d menu=%s console=%s gamestate=%s player=%s spectating=%d demo=%d automap=%d "
-		"chat=%d demorec=%d pending=%d maptime=%d",
+		"chat=%d demorec=%d pending=%d maptime=%d acstemp=%d",
 		token, paused, menu, console, gs,
 		( mo != NULL ) ? ( dead ? "dead" : "alive" ) : "none",
 		( mo != NULL && p->bSpectating ) ? 1 : 0,
@@ -163,7 +176,8 @@ CCMD( mcp_status )
 		// map/load/playdemo queue a gameaction for the next tic, so the rest of
 		// this line still describes the state before it.
 		MCP_LoadPending() ? 1 : 0,
-		level.maptime );
+		level.maptime,
+		MCP_RunAcsModules() );
 
 	// health/armor only mean something with a live player actor -- a menu or
 	// intermission (mo == NULL) reads as gamestate=<not level>, not falsely "dead".

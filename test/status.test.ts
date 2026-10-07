@@ -69,12 +69,14 @@ describe("describeStatus", () => {
       chat: "1",
       demorec: "1",
       pending: "1",
+      acstemp: "2",
     };
     expect(describeStatus(status)).toBe(
       "Engine state: paused, a menu is open (DOptionMenu), console is down, " +
         "not in a level (intermission), player is dead, spectating, " +
         "playing back a demo, automap is open, chat input is open, " +
-        "recording a demo, a map/save/demo load is pending.",
+        "recording a demo, a map/save/demo load is pending, " +
+        "2 run_acs snippet module(s) loaded (saves refused until the map changes).",
     );
   });
 

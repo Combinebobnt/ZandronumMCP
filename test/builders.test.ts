@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { command, buildPuke, buildPukeName, buildSave, UnsafeArgumentError } from "../src/commands/builders.js";
+import { command, buildPuke, buildPukeName, buildRunAcs, buildSave, UnsafeArgumentError } from "../src/commands/builders.js";
 
 describe("command", () => {
   it("joins a verb with string and number tokens", () => {
@@ -44,6 +44,19 @@ describe("buildSave", () => {
   it("rejects unsafe names or descriptions", () => {
     expect(() => buildSave('a"b')).toThrow(UnsafeArgumentError);
     expect(() => buildSave("ok", "a;quit")).toThrow(UnsafeArgumentError);
+  });
+});
+
+describe("buildRunAcs", () => {
+  it("passes a pre-quoted object token through and checks the rest", () => {
+    expect(buildRunAcs('"/tmp/a b/x.o"', 1, -2, "open=1")).toBe('mcp_runacs "/tmp/a b/x.o" 1 -2 open=1');
+    expect(buildRunAcs("/tmp/x.o")).toBe("mcp_runacs /tmp/x.o");
+  });
+
+  it("still rejects a semicolon, quote or newline inside the object or the rest", () => {
+    expect(() => buildRunAcs('"/tmp/a;quit/x.o"')).toThrow(UnsafeArgumentError);
+    expect(() => buildRunAcs('"/tmp/a" ; quit "x.o"')).toThrow(UnsafeArgumentError);
+    expect(() => buildRunAcs("/tmp/x.o", "a;quit")).toThrow(UnsafeArgumentError);
   });
 });
 
