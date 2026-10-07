@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { parsePlayerState, parseTarget } from "../src/parsers/playerstate.js";
+import { parsePlayerState, parseTarget, withLiveStatus } from "../src/parsers/playerstate.js";
+import type { PlayerState } from "../src/parsers/playerstate.js";
 
 describe("parsePlayerState", () => {
   it("parses currentpos including negative coordinates", () => {
@@ -30,5 +31,44 @@ describe("parseTarget", () => {
   });
   it("returns null when nothing is aimed at", () => {
     expect(parseTarget(["(no target)"])).toBeNull();
+  });
+});
+
+describe("withLiveStatus", () => {
+  const base: PlayerState = {
+    x: 0,
+    y: 0,
+    z: 0,
+    angle: 0,
+    floorHeight: 0,
+    sector: 0,
+    light: 160,
+  };
+
+  it("is a no-op on a legacy bridge with no status", () => {
+    expect(withLiveStatus(base, undefined)).toEqual(base);
+  });
+
+  it("leaves the state untouched when the status carries none of these fields", () => {
+    expect(withLiveStatus(base, {})).toEqual(base);
+  });
+
+  it("merges health, armor, liveness and spectating", () => {
+    expect(
+      withLiveStatus(base, { health: "80", armor: "25", player: "alive", spectating: "0" }),
+    ).toEqual({ ...base, health: 80, armor: 25, player: "alive", spectating: false });
+  });
+
+  it("recognizes dead and none as valid player values", () => {
+    expect(withLiveStatus(base, { player: "dead" }).player).toBe("dead");
+    expect(withLiveStatus(base, { player: "none" }).player).toBe("none");
+  });
+
+  it("ignores a player value that isn't alive/dead/none", () => {
+    expect(withLiveStatus(base, { player: "zombie" }).player).toBeUndefined();
+  });
+
+  it("reads spectating=1 as true", () => {
+    expect(withLiveStatus(base, { spectating: "1" }).spectating).toBe(true);
   });
 });

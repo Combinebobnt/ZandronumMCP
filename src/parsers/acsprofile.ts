@@ -1,3 +1,5 @@
+import { stripColor } from "./consoletext.js";
+
 export interface ProfileEntry {
   section: "script" | "function";
   module: string;
@@ -7,12 +9,6 @@ export interface ProfileEntry {
   avg: number;
   min: number;
   max: number;
-}
-
-// Strip ZDoom console colour escapes (\x1c followed by a letter or [name]).
-function stripColor(line: string): string {
-  // eslint-disable-next-line no-control-regex
-  return line.replace(/\x1c(\[[^\]]*\]|.)/g, "");
 }
 
 // The five right-aligned numeric columns at the end of a data row.

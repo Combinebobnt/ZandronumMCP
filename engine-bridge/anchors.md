@@ -14,6 +14,7 @@ of a pristine `hg` checkout at build time — see the project README.
 | 2 | `src/d_main.cpp` | `switch \( NETWORK_GetState\( \)\)` *(scoped to after `void D_DoomLoop`)* | `MCP_Bridge_Poll();` before the switch | runs every frame in **all** modes (single/client/server) |
 | 3 | `src/c_console.cpp` | first `#include` | `#include "mcp_bridge.h"` | make the hooks visible |
 | 4 | `src/c_console.cpp` | `I_PrintStr \(outlinecopy\)` | `MCP_Bridge_TeeOutput( outlinecopy );` after it | mirrors every console line the engine prints |
+| 4a | `src/c_console.cpp` | `C_AddNotifyString \(printlevel, outlinecopy\);` | `if ( MCP_Bridge_ShowInNotify( outlinecopy ) )` before it | keeps the bridge's `__MCPDONE_` correlator lines off the on-screen notify area (console, logfile and tee still get them); the call sits inside braces, so the unbraced guard covers only it |
 | 5 | `src/CMakeLists.txt` | end of file (append) | `target_sources( zdoom PRIVATE mcp_bridge.cpp )` | compile the overlay into the `zdoom` target |
 
 Notes:

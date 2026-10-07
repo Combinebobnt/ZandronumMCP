@@ -224,4 +224,134 @@ describe("BridgeClient <-> FakeBridge", () => {
     const c = new BridgeClient({ port: 1 });
     expect(() => c.sendCommand("quit")).toThrow(/Not connected/);
   });
+
+  it("refreshStatus is a no-op without the status cap", async () => {
+    bridge = await FakeBridge.start(); // default hello: no caps at all
+    client = new BridgeClient({ port: bridge.port });
+    await client.connect();
+    await client.refreshStatus();
+    expect(client.lastStatus).toBeUndefined();
+    expect(bridge.received).toHaveLength(0);
+  });
+
+  it("refreshStatus populates lastStatus via a bare mcp_status probe", async () => {
+    bridge = await FakeBridge.start({ hello: { v: 1, t: "hello", caps: ["cmd", "status"] } });
+    bridge.setStatus({ paused: "1" });
+    client = new BridgeClient({ port: bridge.port });
+    await client.connect();
+    await client.refreshStatus();
+    expect(client.lastStatus).toMatchObject({ paused: "1" });
+    const sent = bridge.received.filter((m) => m.t === "cmd");
+    expect(sent).toHaveLength(1);
+    expect(sent[0].text).toMatch(/^mcp_status /);
+  });
+
+  it("resolves (not rejects) when a status refresh probe times out", async () => {
+    bridge = await FakeBridge.start({
+      hello: { v: 1, t: "hello", caps: ["cmd", "status"] },
+      swallowCommands: true,
+    });
+    client = new BridgeClient({ port: bridge.port });
+    await client.connect();
+    await client.refreshStatus(); // readStatus resolves with no status after ~500ms
+    expect(client.lastStatus).toBeUndefined();
+  });
+
+  it("drops another request's late sentinel line from a command's output", async () => {
+    bridge = await FakeBridge.start({ hello: { v: 1, t: "hello", caps: ["cmd", "status"] } });
+    bridge.respondTo("save s1", ["__MCPDONE_old__ paused=1", "real line"]);
+    client = new BridgeClient({ port: bridge.port });
+    await client.connect();
+    expect(await client.runCommand("save s1")).toEqual(["real line"]);
+    expect(client.lastStatus?.paused).not.toBe("1");
+  });
+
+  it("keeps a multi-line message that only quotes an old sentinel mid-line", async () => {
+    bridge = await FakeBridge.start({ hello: { v: 1, t: "hello", caps: ["cmd", "status"] } });
+    const hud = "MCP_HUD\ntext 0 0 __MCPDONE_old__ paused=0\nimage STBAR 0 168";
+    bridge.respondTo("dumphud", [hud]);
+    client = new BridgeClient({ port: bridge.port });
+    await client.connect();
+    expect(await client.runCommand("dumphud")).toEqual([hud]);
+  });
+
+  describe("readStatus", () => {
+    const statusHello = { hello: { v: 1, t: "hello", caps: ["cmd", "status"] } };
+
+    /** Resolve once the client has seen `text` as console output. */
+    const seen = (text: string) =>
+      new Promise<void>((resolve) => {
+        const on = (t: string) => t === text && (client!.off("output", on), resolve());
+        client!.on("output", on);
+      });
+
+    it("resolves at once with nothing on a capless bridge", async () => {
+      bridge = await FakeBridge.start();
+      client = new BridgeClient({ port: bridge.port });
+      await client.connect();
+      expect(await client.readStatus(1000)).toEqual({ status: undefined, lines: [] });
+      expect(bridge.received).toHaveLength(0);
+    });
+
+    it("returns the snapshot plus what printed since the last command, minus foreign replies", async () => {
+      bridge = await FakeBridge.start(statusHello);
+      bridge.respondTo("load bad", ["loading"], ["__MCPDONE_old__ paused=1", "Could not read savegame 'bad'"]);
+      bridge.setStatus({ pending: "0" });
+      client = new BridgeClient({ port: bridge.port });
+      await client.connect();
+      const late = seen("Could not read savegame 'bad'");
+      expect(await client.runCommand("load bad")).toEqual(["loading"]);
+      await late;
+      const got = await client.readStatus(1000);
+      expect(got.status).toMatchObject({ pending: "0" });
+      expect(got.lines).toEqual(["Could not read savegame 'bad'"]);
+      expect(client.lastStatus).toBe(got.status);
+    });
+
+    it("keeps only the newest idle-time messages", async () => {
+      bridge = await FakeBridge.start(statusHello);
+      const chatter = Array.from({ length: 55 }, (_, i) => `line ${i}`);
+      bridge.respondTo("spam", [], chatter);
+      client = new BridgeClient({ port: bridge.port });
+      await client.connect();
+      const last = seen("line 54");
+      await client.runCommand("spam");
+      await last;
+      expect((await client.readStatus(1000)).lines).toEqual(chatter.slice(5));
+    });
+
+    it("forgets idle-time output once another command starts", async () => {
+      bridge = await FakeBridge.start(statusHello);
+      bridge.respondTo("load bad", [], ["late"]);
+      client = new BridgeClient({ port: bridge.port });
+      await client.connect();
+      const late = seen("late");
+      await client.runCommand("load bad");
+      await late;
+      await client.runCommand("echo hi");
+      expect((await client.readStatus(1000)).lines).toEqual([]);
+    });
+
+    it("returns no status but the lines so far when the read times out", async () => {
+      bridge = await FakeBridge.start({ ...statusHello, swallowCommands: true });
+      client = new BridgeClient({ port: bridge.port });
+      await client.connect();
+      const read = client.readStatus(300);
+      for (let i = 0; i < 100 && bridge.received.length === 0; i++) {
+        await new Promise((r) => setTimeout(r, 5));
+      }
+      bridge.push("busy loading");
+      expect(await read).toEqual({ status: undefined, lines: ["busy loading"] });
+      expect(client.lastStatus).toBeUndefined();
+    });
+
+    it("returns no status when the connection drops mid-read", async () => {
+      bridge = await FakeBridge.start({ ...statusHello, swallowCommands: true });
+      client = new BridgeClient({ port: bridge.port });
+      await client.connect();
+      const read = client.readStatus(2000);
+      bridge.endClients();
+      expect(await read).toEqual({ status: undefined, lines: [] });
+    });
+  });
 });

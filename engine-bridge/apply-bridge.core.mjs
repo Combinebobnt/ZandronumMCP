@@ -168,6 +168,12 @@ export function applyBridge({ src, revert = false, overlayDir, log = () => {} })
     anchor: "I_PrintStr \\(outlinecopy\\)",
     line: "\t\tMCP_Bridge_TeeOutput( outlinecopy );", marker: "MCP_Bridge_TeeOutput",
   }, log);
+  // ...but keep the bridge's own correlator lines off the notify area (an
+  // unbraced guard on the one call; it sits inside braces in PrintString).
+  insertLine(cconsole, {
+    anchor: "C_AddNotifyString \\(printlevel, outlinecopy\\);", position: "Before",
+    line: "\t\t\t\tif ( MCP_Bridge_ShowInNotify( outlinecopy ) )", marker: "MCP_Bridge_ShowInNotify",
+  }, log);
 
   // 3a. v_text.cpp -- tee every drawn HUD string (DrawTextV is the funnel).
   insertLine(vtext, {

@@ -27,10 +27,27 @@ export interface RecordedEvent {
   data2: number;
 }
 
+/** The all-normal `mcp_status` snapshot a fake bridge returns by default. */
+const DEFAULT_STATUS: Record<string, string> = {
+  paused: "0",
+  menu: "off",
+  console: "up",
+  gamestate: "level",
+  player: "alive",
+  spectating: "0",
+  demo: "0",
+  automap: "0",
+  health: "100",
+  armor: "0",
+};
+
 export class FakeBridge {
   private readonly server: net.Server;
   private readonly sockets: net.Socket[] = [];
-  private readonly handlers: Array<{ match: string; lines: string[] }> = [];
+  private readonly handlers: Array<{ match: string; lines: string[]; after: string[] }> = [];
+  /** One-shot overrides, each merged into the next `mcp_status` reply only. */
+  private readonly statusQueue: Array<Record<string, string>> = [];
+  private probesToSwallow = 0;
   private readonly rawHandlers: Array<{ match: string; messages: Record<string, unknown>[] }> = [];
   private readonly swallowed: string[] = [];
   /** Every message the client sent — lets tests assert fire-and-forget sends. */
@@ -41,6 +58,8 @@ export class FakeBridge {
   private readonly pauseWaiters: Array<(v: number) => void> = [];
   readonly events: RecordedEvent[] = [];
   readonly pauses: number[] = [];
+  /** Fields echoed back on the mcp_status correlator line. Override with `setStatus`. */
+  private status: Record<string, string> = DEFAULT_STATUS;
   port = 0;
 
   private constructor(server: net.Server, opts: FakeBridgeOptions) {
@@ -62,9 +81,22 @@ export class FakeBridge {
     });
   }
 
-  /** Reply to any command containing `match` with these output lines. */
-  respondTo(match: string, lines: string[]): this {
-    this.handlers.push({ match, lines });
+  /** Reply to any command containing `match` with these output lines; `after`
+   *  lines follow the sentinel, like engine output printed a tic later. */
+  respondTo(match: string, lines: string[], after: string[] = []): this {
+    this.handlers.push({ match, lines, after });
+    return this;
+  }
+
+  /** Leave the next `count` bare status probes unanswered (a busy engine). */
+  swallowProbes(count: number): this {
+    this.probesToSwallow = count;
+    return this;
+  }
+
+  /** Queue one-shot status overrides, consumed one per `mcp_status` reply. */
+  queueStatus(...snapshots: Array<Record<string, string>>): this {
+    this.statusQueue.push(...snapshots);
     return this;
   }
 
@@ -86,6 +118,19 @@ export class FakeBridge {
     for (const s of this.sockets) {
       s.write(encodeMessage({ v: PROTOCOL_VERSION, t: "out", text, level: 0 }));
     }
+  }
+
+  /** Override/merge fields in the `mcp_status` snapshot this fake returns. */
+  setStatus(fields: Record<string, string>): this {
+    this.status = { ...this.status, ...fields };
+    return this;
+  }
+
+  /** Reset the received-message log, so a test can count only the wire traffic
+   *  from the call it's actually asserting on — after setup traffic (e.g.
+   *  `live()`'s own `attach_instance` refresh) has already landed. */
+  clearReceived(): void {
+    this.received.length = 0;
   }
 
   /** Gracefully FIN every open connection (client sees a clean close). */
@@ -138,26 +183,44 @@ export class FakeBridge {
 
   private handleCommand(socket: net.Socket, text: string): void {
     if (this.swallowCommands) return;
-    // The MCP appends "; echo <sentinel>"; recover the real command + sentinel.
+    // The MCP appends either "; echo <sentinel>" (legacy) or "; mcp_status
+    // <sentinel>" (status-capable bridge) to a real command, or sends a bare
+    // "mcp_status <sentinel>" with no host command at all (a refreshStatus()
+    // probe). Recover the real command (empty for a bare probe) + sentinel.
+    const statusMatch = text.match(/^(?:(.+?)\s*;\s*)?mcp_status\s+(\S+)\s*$/);
     const echoMatch = text.match(/^(.*?)\s*;\s*echo\s+(\S+)\s*$/);
-    const command = (echoMatch ? echoMatch[1] : text).trim();
-    const sentinel = echoMatch ? echoMatch[2] : null;
+    const command = (statusMatch ? (statusMatch[1] ?? "") : echoMatch ? echoMatch[1] : text).trim();
+    const sentinel = statusMatch ? statusMatch[2] : echoMatch ? echoMatch[2] : null;
     if (this.swallowed.some((m) => command.includes(m))) return;
+    if (statusMatch && !command && this.probesToSwallow > 0) {
+      this.probesToSwallow--;
+      return;
+    }
 
     const raw = this.rawHandlers.find((h) => command.includes(h.match));
+    const handler = raw ? undefined : this.handlers.find((h) => command.includes(h.match));
     if (raw) {
       for (const msg of raw.messages) {
         socket.write(encodeMessage({ v: PROTOCOL_VERSION, t: "out", ...msg }));
       }
     } else {
-      const handler = this.handlers.find((h) => command.includes(h.match));
       for (const line of handler ? handler.lines : []) {
         socket.write(encodeMessage({ v: PROTOCOL_VERSION, t: "out", text: line, level: 0 }));
       }
     }
 
-    if (sentinel) {
+    if (statusMatch && sentinel) {
+      const fields = Object.entries({ ...this.status, ...this.statusQueue.shift() })
+        .map(([k, v]) => `${k}=${v}`)
+        .join(" ");
+      socket.write(
+        encodeMessage({ v: PROTOCOL_VERSION, t: "out", text: `${sentinel} ${fields}`, level: 0 }),
+      );
+    } else if (sentinel) {
       socket.write(encodeMessage({ v: PROTOCOL_VERSION, t: "out", text: sentinel, level: 0 }));
+    }
+    for (const line of handler ? handler.after : []) {
+      socket.write(encodeMessage({ v: PROTOCOL_VERSION, t: "out", text: line, level: 0 }));
     }
   }
 

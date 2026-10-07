@@ -3,7 +3,7 @@
 > **Auto-generated** from `src/tools.ts` by `scripts/gen-tools-doc.mjs` — do not
 > edit by hand; run `npm run docs:tools` to regenerate.
 
-The MCP server exposes **52 tools**. Your agent also discovers them at
+The MCP server exposes **55 tools**. Your agent also discovers them at
 runtime via each tool's `description`, so this is mainly for browsing.
 
 ## Commands, cheats & input
@@ -20,6 +20,9 @@ runtime via each tool's `description`, so this is mainly for browsing.
 - **`menu_key`** — Send a single menu navigation key (GUI key event) to the active menu.
 - **`menu_nav`** — Send a sequence of menu keys (e.g. ["down","down","enter"]) with a small delay between each.
 - **`menu_text`** — Type a string into the active menu text-entry field (e.g. the player name box after pressing enter on it), one character at a time.
+- **`mouse_move`** — Move the pointer to a screen position, in pixels from the top-left of the game window. Drives hover-only UI -- tooltips, hot states -- which nothing else here can reach.
+- **`mouse_click`** — Press and release the left button at a position. Give toX/toY to DRAG: press at the first point, move through it, release at the second. `double` sends a double-click.
+- **`mouse_wheel`** — Wheel notches at the current pointer position. Positive scrolls up, negative down.
 - **`verify_menu`** — Open a menu (via a console command like `menu_options`), apply navigation steps, then return a screenshot to verify it.
 
 ## Time control
@@ -48,7 +51,7 @@ runtime via each tool's `description`, so this is mainly for browsing.
 
 ## Live player / target state
 
-- **`player_state`** — Run `currentpos` and return the player's position, angle, floor height, sector, and light level.
+- **`player_state`** — Run `currentpos` and return the player's position, angle, floor height, sector, light level, and (on a status-capable bridge) health, armor, and whether the player is alive, dead, or spectating.
 - **`actor_state`** — Run `dumpactor` and return an actor's live state: class, health, position, current DECORATE state (sprite/frame/tics, e.g. TNT1 A 0), inventory, and (for players) ready weapon + morph status. Defaults to the player; pass a TID for any actor.
 - **`read_hud`** — Run `dumphud` and return everything the engine painted last frame: HUD text strings (with screen x/y), images (by texture name + position), and active ACS HUD messages (full composed text, layer, position, remaining tics). Captures menus too.
 - **`actors_near`** — Run `actorsnear` and return actors within a radius (map units, default 512) of the player: class, health, position, and current sprite.

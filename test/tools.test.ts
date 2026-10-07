@@ -29,7 +29,16 @@ interface LiveOptions {
   io?: Partial<ContextIo>;
 }
 
-/** Harness wired to a fake engine bridge on a real loopback port. */
+/**
+ * Harness wired to a fake engine bridge on a real loopback port.
+ *
+ * Do NOT add "status" to this default cap list: `registerLive` (tools.ts)
+ * wraps every live tool, including `verify_menu`, and would start sending a
+ * refresh probe whenever a tool ran no command of its own — breaking the "no
+ * command was sent" assertions below (e.g. "screenshots without opening or
+ * navigating") that only hold on a bridge with no `status` cap. Use
+ * `liveStatus()` for status-cap-specific tests instead.
+ */
 async function live(opts: LiveOptions = {}): Promise<Harness> {
   bridge = await FakeBridge.start({
     hello: { v: 1, t: "hello", engine: "fake", caps: opts.caps ?? ["cmd", "event", "time"] },
@@ -475,6 +484,49 @@ describe("savegame and demo tools", () => {
     expect(await h.text("load_game", { name: "other" })).toBe("(loaded)");
     expect(await h.text("play_demo", { name: "d1" })).toBe("Playing");
     expect(await h.text("play_demo", { name: "other" })).toBe("(playing)");
+  });
+
+  describe("waiting for a queued load (status cap)", () => {
+    const statusCaps = { caps: ["cmd", "event", "time", "status"] };
+    const probes = () => bridge!.received.filter((m) => m.t === "cmd" && /^mcp_status /.test(m.text ?? ""));
+
+    it("polls until pending clears, so the note describes the new map", async () => {
+      const h = await live(statusCaps);
+      bridge!.clearReceived();
+      bridge!.queueStatus({ pending: "1" }, { pending: "1" }, { pending: "0", gamestate: "level" });
+      const result = await h.call("load_map", { mapName: "MAP02" });
+      expect(result.content).toEqual([{ type: "text", text: "loaded MAP02" }]);
+      expect(probes()).toHaveLength(2);
+    });
+
+    it("returns what the engine printed after the command, e.g. a load error", async () => {
+      const h = await live(statusCaps);
+      bridge!.respondTo("load bad", [], ["Could not read savegame 'bad'"]);
+      expect(await h.text("load_game", { name: "bad" })).toBe("Could not read savegame 'bad'");
+    });
+
+    it("strips the level-start banner's bar glyphs and colour escapes", async () => {
+      const h = await live(statusCaps);
+      const bar = "\x1d" + "\x1e".repeat(30) + "\x1f";
+      bridge!.respondTo("map MAP01", [], [`\n${bar}\n`, "\n\x1c+MAP01 - entryway\n\n"]);
+      expect(await h.text("load_map", { mapName: "MAP01" })).toBe("MAP01 - entryway");
+    });
+
+    it("re-reads after a probe the busy engine never answered", async () => {
+      const h = await live(statusCaps);
+      bridge!.clearReceived();
+      bridge!.swallowProbes(1);
+      expect(await h.text("play_demo", { name: "d1" })).toBe("(playing)");
+      expect(probes()).toHaveLength(2);
+    });
+
+    it("says so when the load is still pending at the end of the budget", async () => {
+      const h = await live(statusCaps);
+      bridge!.setStatus({ pending: "1" });
+      const result = await h.call("load_map", { mapName: "MAP02" });
+      expect(result.content?.[0]?.text).toBe("(load still pending after ~5 s; the engine-state note may predate it)");
+      expect(result.content?.at(-1)?.text).toBe("Engine state: a map/save/demo load is pending.");
+    });
   });
 });
 
@@ -1038,5 +1090,91 @@ describe("attach_instance failure reporting", () => {
     expect(result.isError).toBe(true);
     expect(result.content?.[0]?.text).toMatch(/socket exploded/);
     expect(harness.ctx.isBound(1)).toBe(false);
+  });
+});
+
+describe("engine-state note (registerLive)", () => {
+  /**
+   * Harness wired to a status-capable fake bridge, defaulted to an unusual
+   * snapshot (paused) so most tools get a note without per-test setup.
+   * `clearReceived()` drops `live()`'s own `attach_instance` traffic (that
+   * call is itself wrapped by `registerLive` and refreshes on attach), so
+   * wire-count assertions in each test start from zero.
+   */
+  async function liveStatus(opts: LiveOptions = {}): Promise<Harness> {
+    const h = await live({ ...opts, caps: opts.caps ?? ["cmd", "event", "time", "status"] });
+    bridge!.setStatus({ paused: "1" });
+    bridge!.clearReceived();
+    return h;
+  }
+
+  const cmdsSent = () => bridge!.received.filter((m) => m.t === "cmd");
+
+  it("appends the note after content without touching structuredContent", async () => {
+    const h = await liveStatus({
+      responses: { dumpactors: ["DoomImp\t3001\t5\tDoom\tzandronum.pk3:actors/imp.txt"] },
+    });
+    const result = await h.call("list_actor_classes");
+    expect(result.structuredContent?.actors).toEqual([
+      { name: "DoomImp", edNum: 3001, spawnId: 5, filter: "Doom", source: "zandronum.pk3:actors/imp.txt" },
+    ]);
+    const content = result.content ?? [];
+    expect(content[content.length - 1]).toEqual({ type: "text", text: "Engine state: paused." });
+  });
+
+  it("appends the note after image content via a bare refresh probe (the stub capture runs no command)", async () => {
+    const h = await liveStatus();
+    const result = await h.call("screenshot");
+    expect(result.content).toEqual([
+      { type: "image", data: "UE5H", mimeType: "image/png" },
+      { type: "text", text: "Engine state: paused." },
+    ]);
+    const statusOnly = cmdsSent().filter((m) => /^mcp_status /.test(m.text ?? ""));
+    expect(statusOnly).toHaveLength(1);
+  });
+
+  it("appends the note to an isError result", async () => {
+    const h = await liveStatus();
+    const result = await h.call("get_acs_var", { scope: "world", index: 0 });
+    expect(result.isError).toBe(true);
+    const content = result.content ?? [];
+    expect(content[content.length - 1]).toEqual({ type: "text", text: "Engine state: paused." });
+  });
+
+  it("refreshes via exactly one bare probe for an input-only tool", async () => {
+    const h = await liveStatus();
+    expect(await h.tail("menu_key", { key: "down" })).toBe("Engine state: paused.");
+    expect(cmdsSent()).toHaveLength(1);
+    expect(cmdsSent()[0].text).toMatch(/^mcp_status /);
+  });
+
+  it("waits ~2 tics after posted input events before the probe, and not otherwise", async () => {
+    const sleeps: Array<{ ms: number; cmds: number }> = [];
+    const sleep = (ms: number) => {
+      sleeps.push({ ms, cmds: cmdsSent().length });
+      return Promise.resolve();
+    };
+    const h = await liveStatus({ io: { sleep } });
+    sleeps.length = 0;
+    await h.call("menu_key", { key: "back" });
+    expect(sleeps).toEqual([{ ms: 60, cmds: 0 }]);
+    expect(cmdsSent()).toHaveLength(1);
+    sleeps.length = 0;
+    await h.call("screenshot");
+    expect(sleeps).toEqual([]);
+  });
+
+  it("rides the note on the command's own sentinel line, sending exactly one command", async () => {
+    const h = await liveStatus();
+    expect(await h.tail("run_command", { text: "version" })).toBe("Engine state: paused.");
+    expect(cmdsSent()).toHaveLength(1);
+  });
+
+  it("adds no note and sends no extra command on a legacy echo bridge", async () => {
+    const h = await live({ caps: ["cmd", "event", "time"] }); // no "status" cap
+    bridge!.clearReceived();
+    const result = await h.call("menu_key", { key: "down" });
+    expect(result.content).toHaveLength(1);
+    expect(cmdsSent()).toHaveLength(0);
   });
 });

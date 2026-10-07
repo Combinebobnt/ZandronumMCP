@@ -21,6 +21,10 @@ void MCP_Bridge_Poll();
 // Mirrors one line of console output to the connected MCP client (NDJSON).
 void MCP_Bridge_TeeOutput(const char *text);
 
+// False for the bridge's own correlator lines (__MCPDONE_...), so they reach the
+// console, logfile and tee but never the on-screen notify area.
+bool MCP_Bridge_ShowInNotify(const char *text);
+
 // Optional explicit shutdown (process exit also closes the socket).
 void MCP_Bridge_Shutdown();
 
