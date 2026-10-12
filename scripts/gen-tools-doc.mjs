@@ -55,14 +55,19 @@ const propVal = (obj, key) => {
   return p ? strVal(p.initializer) : undefined;
 };
 
-// 3. Collect every server.registerTool("name", { title, description, ... }, ...).
+// 3. Collect every server.registerTool("name", { title, description, ... }, ...)
+//    AND every registerLive("name", { ... }, ...) — the wrapper that adds the
+//    live engine-state note to a tool's response (tools.ts) without changing
+//    its title/description shape, so it's parsed exactly the same way.
 const tools = [];
 const visit = (node) => {
-  if (
+  const isRegisterTool =
     ts.isCallExpression(node) &&
     ts.isPropertyAccessExpression(node.expression) &&
-    node.expression.name.text === "registerTool"
-  ) {
+    node.expression.name.text === "registerTool";
+  const isRegisterLive =
+    ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === "registerLive";
+  if (isRegisterTool || isRegisterLive) {
     const [nameArg, metaArg] = node.arguments;
     const name = strVal(nameArg);
     if (name && metaArg && ts.isObjectLiteralExpression(metaArg)) {
@@ -78,8 +83,16 @@ const visit = (node) => {
 };
 visit(sf);
 
-if (tools.length === 0) {
-  console.error("No tools found — did server.registerTool() change shape?");
+// A hand-maintained "did it change shape" floor rather than a bare `=== 0`
+// guard: the registerLive rollout showed that a call-form the visitor doesn't
+// recognize silently drops JUST those tools (43 of them, that time) rather
+// than emitting nothing — a `length === 0` check would never have caught it.
+const MIN_EXPECTED_TOOLS = 55;
+if (tools.length < MIN_EXPECTED_TOOLS) {
+  console.error(
+    `Found only ${tools.length} tools (expected at least ${MIN_EXPECTED_TOOLS}) — ` +
+      `did server.registerTool()/registerLive() change shape?`,
+  );
   process.exit(1);
 }
 

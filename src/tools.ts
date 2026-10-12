@@ -1,4 +1,5 @@
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer, ToolCallback } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { ZodRawShapeCompat } from "@modelcontextprotocol/sdk/server/zod-compat.js";
 import { z } from "zod";
 import path from "node:path";
 import type { ServerContext } from "./context.js";
@@ -9,9 +10,13 @@ import { parseAcsVars } from "./parsers/acsvars.js";
 import { parseMapVar, parseMapArray, parseModules } from "./parsers/mapvars.js";
 import { parseScripts, parseFunctions } from "./parsers/scripts.js";
 import { parseAcsProfile } from "./parsers/acsprofile.js";
-import { parsePlayerState, parseTarget } from "./parsers/playerstate.js";
+import { cleanConsoleLines } from "./parsers/consoletext.js";
+import { parsePlayerState, parseTarget, withLiveStatus } from "./parsers/playerstate.js";
+import { pollUntil } from "./poll.js";
 import { parseActorState, parseActorsNear } from "./parsers/actorstate.js";
 import { parseHud } from "./parsers/hud.js";
+import { describeStatus } from "./parsers/status.js";
+import type { BridgeClient } from "./bridge/transport.js";
 import { findSymbol } from "./acs/symbols.js";
 import { collectAcsLumps } from "./acs/collect.js";
 import { parseBehaviorNames } from "./acs/bytecode.js";
@@ -78,6 +83,13 @@ const NO_TIME_CAP =
 const NO_INPUT_CAP =
   "This engine bridge has no input support (rebuild with the latest bridge).";
 
+// A load tool polls status until its queued load runs: about 5 s in all.
+const LOAD_READ_MS = 500;
+const LOAD_WAIT_MS = 50;
+const LOAD_WAITS = 9;
+// About 2 tics: posted input events are processed on the next tic, not on receipt.
+const INPUT_SETTLE_MS = 60;
+
 /** Register every MCP tool against a context. */
 export function registerTools(server: McpServer, ctx: ServerContext): void {
   const sleep = (ms: number) => ctx.io.sleep(ms);
@@ -119,6 +131,96 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     }
   }
 
+  /**
+   * Register a tool that talks to a live engine, so its response carries a
+   * short "engine state" note whenever something about the game is unusual
+   * (paused, in a menu, dead, at intermission, ...). Silence means normal, so
+   * a healthy round trip costs nothing to read — see `parsers/status.ts`.
+   *
+   * The `commandCount` diff decides whether to refresh: if it didn't move
+   * across the handler call, the handler ran no console command (an
+   * input-only tool, or a client that didn't exist until the handler created
+   * it — `attach_instance`/`launch_instance`), so the cached status predates
+   * whatever the handler just did. If it DID move, the handler's own command
+   * already refreshed it via that command's own sentinel line, so refreshing
+   * again would just be a second wasted round trip. This subsumes a
+   * hand-maintained list of "tools that run a command", which would get cases
+   * like `verify_menu` (runs a command only when `open` is given) wrong.
+   *
+   * Two invariants the wrapper must not violate:
+   * - It only ever PEEKS the registry (`ctx.attachedClient`), never
+   *   `ctx.clientFor` — so it can never itself open a socket or turn a
+   *   successful call into a failure.
+   * - It does not try/catch the handler: a thrown error (unbound instance, a
+   *   `loadMap` failure) must propagate byte-identically to a plain
+   *   `server.registerTool` call.
+   */
+  function registerLive<Input extends ZodRawShapeCompat & { instance: typeof instanceArg }>(
+    name: string,
+    config: {
+      title?: string;
+      description?: string;
+      inputSchema: Input;
+      outputSchema?: ZodRawShapeCompat;
+    },
+    handler: ToolCallback<Input>,
+  ): void {
+    // TS can't carry an abstract `Input` through the SDK's own generic
+    // machinery inside this function body (a known limitation of generic
+    // functions built on other generics) — so the args/extra/result shapes
+    // are pinned to a concrete instantiation here and the two boundaries
+    // (calling `handler`, registering `wrapped`) are cast back to `Input`.
+    // Every *call site* of `registerLive` still gets full inference, because
+    // there `Input` is concrete, not abstract.
+    type Args = { instance: number } & Record<string, unknown>;
+    type Extra = Parameters<ToolCallback<{ instance: typeof instanceArg }>>[1];
+    type Result = Awaited<ReturnType<ToolCallback<{ instance: typeof instanceArg }>>>;
+    const rawHandler = handler as unknown as (args: Args, extra: Extra) => Promise<Result>;
+
+    const wrapped = async (args: Args, extra: Extra): Promise<Result> => {
+      const instance = args.instance;
+      const prior = ctx.attachedClient(instance);
+      const before = prior?.commandCount;
+      const eventsBefore = prior?.eventCount ?? 0;
+      const result = await rawHandler(args, extra);
+      const client = ctx.attachedClient(instance);
+      const advanced = before !== undefined && client !== undefined && client.commandCount > before;
+      if (client && !advanced) {
+        // Posted events run on a later tic, so a same-instant read would predate them.
+        if (client.eventCount > eventsBefore) await sleep(INPUT_SETTLE_MS);
+        await client.refreshStatus();
+      }
+      const status = client?.lastStatus;
+      const note = status ? describeStatus(status) : undefined;
+      if (!note) return result;
+      return { ...result, content: [...result.content, { type: "text", text: note }] };
+    };
+    server.registerTool(name, config, wrapped as unknown as ToolCallback<Input>);
+  }
+
+  /**
+   * Run `map`/`load`/`playdemo`, which only queue a load for the next tic (so the
+   * command's own status line predates it), then poll status until `pending=0`.
+   * Returns the output plus what the engine printed meanwhile, e.g. a load error.
+   */
+  async function runLoad(client: BridgeClient, cmd: string): Promise<string[]> {
+    const out = await client.runCommand(cmd);
+    if (!client.supports("status")) return cleanConsoleLines(out);
+    const printed: string[] = [];
+    // A snapshot with no pending= field (an older overlay) counts as settled.
+    const read = async () => {
+      const got = await client.readStatus(LOAD_READ_MS);
+      printed.push(...got.lines);
+      return got.status !== undefined && got.status.pending !== "1";
+    };
+    const { value: settled } = await pollUntil(read, (s) => s, {
+      waits: LOAD_WAITS,
+      wait: () => sleep(LOAD_WAIT_MS),
+    });
+    const caveat = settled ? [] : ["(load still pending after ~5 s; the engine-state note may predate it)"];
+    return [...cleanConsoleLines([...out, ...printed]), ...caveat];
+  }
+
   function postMenuKey(
     client: { sendEvent: (a: number, b: number, c: number, d: number) => void },
     key: MenuKey,
@@ -135,7 +237,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
   }
 
   // --- commands, cheats & input ---------------------------------------------
-  server.registerTool(
+  registerLive(
     "run_command",
     {
       title: "Run console command",
@@ -150,7 +252,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
   );
 
-  server.registerTool(
+  registerLive(
     "list_actor_classes",
     {
       title: "List actor classes",
@@ -180,7 +282,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
   );
 
-  server.registerTool(
+  registerLive(
     "summon",
     {
       title: "Summon actor",
@@ -199,7 +301,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
   );
 
-  server.registerTool(
+  registerLive(
     "give",
     {
       title: "Give item",
@@ -218,7 +320,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
   );
 
-  server.registerTool(
+  registerLive(
     "take",
     {
       title: "Take item",
@@ -237,7 +339,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
   );
 
-  server.registerTool(
+  registerLive(
     "load_map",
     {
       title: "Load map",
@@ -246,12 +348,12 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
     async ({ instance, mapName }) => {
       const client = await ctx.clientFor(instance);
-      const output = await client.runCommand(command("map", mapName));
+      const output = await runLoad(client, command("map", mapName));
       return { content: [{ type: "text", text: output.join("\n") || `loaded ${mapName}` }] };
     },
   );
 
-  server.registerTool(
+  registerLive(
     "list_running_scripts",
     {
       title: "List running ACS scripts",
@@ -279,7 +381,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
   );
 
-  server.registerTool(
+  registerLive(
     "run_script",
     {
       title: "Run ACS script",
@@ -300,7 +402,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
   );
 
-  server.registerTool(
+  registerLive(
     "screenshot",
     {
       title: "Screenshot",
@@ -316,7 +418,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
   );
 
-  server.registerTool(
+  registerLive(
     "menu_key",
     {
       title: "Press a menu key",
@@ -333,7 +435,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
   );
 
-  server.registerTool(
+  registerLive(
     "menu_nav",
     {
       title: "Navigate a menu",
@@ -358,7 +460,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
   );
 
-  server.registerTool(
+  registerLive(
     "menu_text",
     {
       title: "Type into a menu text field",
@@ -382,7 +484,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
   );
 
-  server.registerTool(
+  registerLive(
     "mouse_move",
     {
       title: "Move the mouse pointer",
@@ -401,7 +503,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
   );
 
-  server.registerTool(
+  registerLive(
     "mouse_click",
     {
       title: "Click or drag the mouse",
@@ -452,7 +554,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
   );
 
-  server.registerTool(
+  registerLive(
     "mouse_wheel",
     {
       title: "Scroll the mouse wheel",
@@ -477,7 +579,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
   );
 
-  server.registerTool(
+  registerLive(
     "verify_menu",
     {
       title: "Open, navigate, and screenshot a menu",
@@ -515,7 +617,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
   // backgrounded instance. These tools set the engine's pause flag directly so
   // time-based behavior — charge weapons, projectiles, animations, monster AI —
   // is actually testable headless.
-  server.registerTool(
+  registerLive(
     "set_pause",
     {
       title: "Pause or resume the game",
@@ -533,7 +635,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
   );
 
-  server.registerTool(
+  registerLive(
     "step",
     {
       title: "Advance the game by N tics",
@@ -558,7 +660,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
   );
 
   // --- ACS world/global variable read/write ---------------------------------
-  server.registerTool(
+  registerLive(
     "get_acs_var",
     {
       title: "Get ACS variable",
@@ -579,7 +681,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
   );
 
-  server.registerTool(
+  registerLive(
     "set_acs_var",
     {
       title: "Set ACS variable",
@@ -608,7 +710,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
   );
 
-  server.registerTool(
+  registerLive(
     "list_acs_vars",
     {
       title: "List non-zero ACS variables",
@@ -715,7 +817,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
   );
 
-  server.registerTool(
+  registerLive(
     "save_game",
     {
       title: "Save the game",
@@ -737,7 +839,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
   );
 
-  server.registerTool(
+  registerLive(
     "load_game",
     {
       title: "Load a savegame",
@@ -746,12 +848,12 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
     async ({ instance, name }) => {
       const client = await ctx.clientFor(instance);
-      const out = (await client.runCommand(command("load", name))).join("\n");
+      const out = (await runLoad(client, command("load", name))).join("\n");
       return { content: [{ type: "text", text: out.trim() || "(loaded)" }] };
     },
   );
 
-  server.registerTool(
+  registerLive(
     "play_demo",
     {
       title: "Play a demo",
@@ -761,26 +863,29 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
     async ({ instance, name }) => {
       const client = await ctx.clientFor(instance);
-      const out = (await client.runCommand(command("playdemo", name))).join("\n");
+      const out = (await runLoad(client, command("playdemo", name))).join("\n");
       return { content: [{ type: "text", text: out.trim() || "(playing)" }] };
     },
   );
 
   // --- live player / target state -------------------------------------------
-  server.registerTool(
+  registerLive(
     "player_state",
     {
       title: "Player state",
       description:
-        "Run `currentpos` and return the player's position, angle, floor height, sector, and light level.",
+        "Run `currentpos` and return the player's position, angle, floor height, sector, light level, and (on a status-capable bridge) health, armor, and whether the player is alive, dead, or spectating.",
       inputSchema: { instance: instanceArg },
     },
     async ({ instance }) => {
       const client = await ctx.clientFor(instance);
-      const state = parsePlayerState(await client.runCommand("currentpos"));
-      if (!state) {
+      const parsed = parsePlayerState(await client.runCommand("currentpos"));
+      if (!parsed) {
         return { isError: true, content: [{ type: "text", text: "no player (not in a level?)" }] };
       }
+      // Already fresh with zero extra round trips: the `currentpos` command
+      // above just refreshed `lastStatus` via its own sentinel line.
+      const state = withLiveStatus(parsed, client.lastStatus);
       return {
         content: [{ type: "text", text: JSON.stringify(state) }],
         structuredContent: { ...state },
@@ -788,7 +893,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
   );
 
-  server.registerTool(
+  registerLive(
     "actor_state",
     {
       title: "Actor state (DECORATE)",
@@ -813,7 +918,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
   );
 
-  server.registerTool(
+  registerLive(
     "read_hud",
     {
       title: "Read on-screen HUD",
@@ -836,7 +941,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
   );
 
-  server.registerTool(
+  registerLive(
     "actors_near",
     {
       title: "Actors near the player",
@@ -855,7 +960,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
   );
 
-  server.registerTool(
+  registerLive(
     "inspect_target",
     {
       title: "Inspect aimed target",
@@ -877,7 +982,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
   );
 
   // --- ACS scripts / functions / profiling ----------------------------------
-  server.registerTool(
+  registerLive(
     "list_scripts",
     {
       title: "List ACS scripts",
@@ -895,7 +1000,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
   );
 
-  server.registerTool(
+  registerLive(
     "list_functions",
     {
       title: "List ACS functions",
@@ -912,7 +1017,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
   );
 
-  server.registerTool(
+  registerLive(
     "profile_scripts",
     {
       title: "Profile ACS scripts",
@@ -930,7 +1035,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
   );
 
-  server.registerTool(
+  registerLive(
     "profile_window",
     {
       title: "Profile a time window",
@@ -958,7 +1063,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
   );
 
   // --- map-scope ACS variables/arrays (by name, across loaded modules) ------
-  server.registerTool(
+  registerLive(
     "list_modules",
     {
       title: "List loaded ACS modules",
@@ -976,7 +1081,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
   );
 
-  server.registerTool(
+  registerLive(
     "get_map_var",
     {
       title: "Get map variable",
@@ -993,7 +1098,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
   );
 
-  server.registerTool(
+  registerLive(
     "set_map_var",
     {
       title: "Set map variable",
@@ -1013,7 +1118,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
   );
 
-  server.registerTool(
+  registerLive(
     "get_map_array",
     {
       title: "Get map array element",
@@ -1033,7 +1138,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
   );
 
-  server.registerTool(
+  registerLive(
     "set_map_array",
     {
       title: "Set map array element",
@@ -1066,7 +1171,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     return parseRenderInfo(await client.runCommand("dumprenderer"));
   }
 
-  server.registerTool(
+  registerLive(
     "renderer_info",
     {
       title: "Renderer info",
@@ -1092,7 +1197,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
   );
 
-  server.registerTool(
+  registerLive(
     "viewport_info",
     {
       title: "Viewport info",
@@ -1111,7 +1216,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
   );
 
-  server.registerTool(
+  registerLive(
     "hud_info",
     {
       title: "HUD info",
@@ -1224,7 +1329,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
   );
 
   // --- process management ----------------------------------------------------
-  server.registerTool(
+  registerLive(
     "launch_instance",
     {
       title: "Launch a Zandronum instance",
@@ -1325,7 +1430,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
   );
 
-  server.registerTool(
+  registerLive(
     "attach_instance",
     {
       title: "Attach to an engine you started yourself",

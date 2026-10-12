@@ -53,6 +53,9 @@ export interface Harness {
   ctx: ServerContext;
   /** Call a tool and return its first text content (or "" for non-text). */
   text: (name: string, args?: Record<string, unknown>) => Promise<string>;
+  /** Call a tool and return its LAST text content block (or "" for none) — the
+   *  engine-state note, when `registerLive` appends one, is always last. */
+  tail: (name: string, args?: Record<string, unknown>) => Promise<string>;
   /** Call a tool and return the raw result. */
   call: (name: string, args?: Record<string, unknown>) => Promise<CallResult>;
   /** Call a tool, collecting the progress notifications it emits. */
@@ -131,6 +134,11 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     text: async (name, args) => {
       const result = await call(name, args);
       return result.content?.[0]?.text ?? "";
+    },
+    tail: async (name, args) => {
+      const result = await call(name, args);
+      const content = result.content ?? [];
+      return content[content.length - 1]?.text ?? "";
     },
     close: async () => {
       ctx.registry.closeAll();

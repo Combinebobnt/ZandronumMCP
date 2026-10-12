@@ -1,10 +1,26 @@
 import net from "node:net";
 import { EventEmitter } from "node:events";
 import { NdjsonDecoder, encodeMessage } from "./framing.js";
-import { makeSentinel, withSentinel } from "../correlation/sentinel.js";
+import { makeSentinel, statusRequest, withSentinel, stripForeignSentinels } from "../correlation/sentinel.js";
 import { collectUntilSentinel } from "../correlation/collector.js";
+import { parseStatus, type EngineStatus } from "../parsers/status.js";
 import { PROTOCOL_VERSION } from "../types.js";
 import type { BridgeMessage, HelloMessage, OutputMessage } from "../types.js";
+
+/** How long a bare status refresh may take before it's abandoned. Short and
+ *  fixed — this is a between-commands cache-freshening probe, not a command a
+ *  caller is waiting on, so it must never be the thing that makes a tool call
+ *  slow. */
+const STATUS_REFRESH_TIMEOUT_MS = 500;
+/** Most idle-time output messages kept for the next status probe. */
+const UNCLAIMED_MAX = 50;
+
+/** One `readStatus` round trip: the parsed snapshot (undefined on a timeout,
+ *  a disconnect or a capless bridge) plus any other output that arrived meanwhile. */
+export interface StatusRead {
+  status: EngineStatus | undefined;
+  lines: string[];
+}
 
 export interface BridgeClientOptions {
   host?: string;
@@ -39,7 +55,18 @@ export class BridgeClient extends EventEmitter {
   /** Tail of the serialisation chain; the next command starts when it settles. */
   private queue: Promise<unknown> = Promise.resolve();
   private capsSet = new Set<string>();
+  /** Count of commands sent on the wire, and the source of each one's
+   *  correlation id. Starts at 0 (load-bearing: `registerLive` in tools.ts
+   *  snapshots this before a handler runs and compares after, and "no client
+   *  yet" vs. "client at its initial count" must be distinguishable from a
+   *  client that has actually sent a command). */
   private seq = 0;
+  /** Count of input events posted, so `registerLive` can tell an input tool. */
+  private events = 0;
+  private lastStatusValue: EngineStatus | undefined;
+  /** Output that arrived with nothing on the wire since the last command
+   *  started; the next status probe hands it back (bounded). */
+  private unclaimed: string[] = [];
   private readonly host: string;
   private readonly port: number;
   private readonly commandTimeoutMs: number;
@@ -57,6 +84,25 @@ export class BridgeClient extends EventEmitter {
    *  engine that happened to still hold the port. */
   get enginePid(): number | undefined {
     return this.enginePidValue;
+  }
+
+  /** The engine-state fields from the most recent completed round trip (a real
+   *  command's own sentinel line, or a bare `refreshStatus()` probe), or
+   *  `undefined` if none has completed yet or the bridge has no `status` cap. */
+  get lastStatus(): EngineStatus | undefined {
+    return this.lastStatusValue;
+  }
+
+  /** Number of commands sent on the wire so far (0-based start — see the field
+   *  comment). Public so `registerLive` can tell whether a tool handler ran a
+   *  console command without having to track it itself. */
+  get commandCount(): number {
+    return this.seq;
+  }
+
+  /** Number of input events posted so far (`sendEvent`). */
+  get eventCount(): number {
+    return this.events;
   }
 
   connect(): Promise<HelloMessage> {
@@ -121,12 +167,30 @@ export class BridgeClient extends EventEmitter {
     const level = typeof out.level === "number" ? out.level : 0;
     this.emit("output", text, level);
     const cmd = this.pending;
-    if (!cmd) return;
-    cmd.lines.push(text);
+    if (!cmd) {
+      // e.g. a load error printed a tic after `load` returned, before the next probe.
+      this.unclaimed.push(text);
+      if (this.unclaimed.length > UNCLAIMED_MAX) this.unclaimed.shift();
+      return;
+    }
+    // A timed-out status probe's reply can land late, inside the next command.
+    const own = stripForeignSentinels(text, cmd.sentinel);
+    if (own === undefined) return;
+    cmd.lines.push(own);
     const result = collectUntilSentinel(cmd.lines, cmd.sentinel);
     if (result.complete) {
       clearTimeout(cmd.timer);
       this.pending = undefined;
+      // `text` is the just-arrived line, which is the one that made
+      // `collectUntilSentinel` complete (an earlier sentinel-bearing line would
+      // already have resolved `cmd` on a prior dispatch, so `cmd` would be
+      // undefined here). Cached unconditionally: a legacy bare-echo line parses
+      // to `undefined` and simply leaves the previous value alone -- the
+      // engine's own `echo` CCMD (c_console.cpp) prints a single argument as
+      // exactly that argument plus a newline, so a bare `echo <sentinel>` line
+      // is never anything but the sentinel on its own.
+      const status = parseStatus(text, cmd.sentinel);
+      if (status) this.lastStatusValue = status;
       cmd.resolve(result.output);
     }
   }
@@ -139,9 +203,17 @@ export class BridgeClient extends EventEmitter {
    * output. The timeout covers the command's own run, not its wait in the queue.
    */
   runCommand(text: string, timeoutMs?: number): Promise<string[]> {
-    const exec = () => this.execCommand(text, timeoutMs);
-    // Run next regardless of how the previous one settled, and swallow on the
-    // chain copy only — the returned promise still carries the rejection.
+    return this.enqueue(() => this.execCommand(text, timeoutMs));
+  }
+
+  /**
+   * Chain `exec` behind whatever is already queued, regardless of how that
+   * settled, so overlapping callers (parallel MCP tool calls, or a status
+   * refresh landing between them) can't cross-contaminate each other's output.
+   * Shared by `runCommand` and `refreshStatus` — a refresh probe is still one
+   * command on the wire and must obey the same one-at-a-time invariant.
+   */
+  private enqueue<T>(exec: () => Promise<T>): Promise<T> {
     const result = this.queue.then(exec, exec);
     this.queue = result.then(
       () => undefined,
@@ -156,6 +228,7 @@ export class BridgeClient extends EventEmitter {
     const id = (++this.seq).toString(36);
     const sentinel = makeSentinel(id);
     const effectiveTimeout = timeoutMs ?? this.commandTimeoutMs;
+    this.unclaimed = [];
     return new Promise<string[]>((resolve, reject) => {
       const timer = setTimeout(() => {
         // Serialised, so whatever is pending at this point is this command.
@@ -164,8 +237,72 @@ export class BridgeClient extends EventEmitter {
       }, effectiveTimeout);
       this.pending = { sentinel, lines: [], resolve, reject, timer };
       socket.write(
-        encodeMessage({ v: PROTOCOL_VERSION, t: "cmd", text: withSentinel(text, sentinel) }),
+        encodeMessage({
+          v: PROTOCOL_VERSION,
+          t: "cmd",
+          text: withSentinel(text, sentinel, this.supports("status")),
+        }),
       );
+    });
+  }
+
+  /**
+   * Refresh `lastStatus` between commands — e.g. after an input-only tool call
+   * (mouse move, menu key) that ran no console command, so the cached state
+   * doesn't predate whatever that call just did. A no-op on a bridge without
+   * the `status` cap: MUST return before touching the queue or the socket, or
+   * every tool call on a capless bridge would pay for a probe that can never
+   * complete.
+   *
+   * Best-effort bookkeeping, never something a tool call should fail over:
+   * a 500 ms `readStatus` whose result is dropped.
+   */
+  refreshStatus(): Promise<void> {
+    return this.readStatus(STATUS_REFRESH_TIMEOUT_MS).then(() => undefined);
+  }
+
+  /**
+   * One exact status read: the parsed snapshot, or `status: undefined` when it
+   * timed out (e.g. the engine is busy loading a map) or the connection dropped;
+   * never a rejection. Also returns any other output collected while waiting,
+   * and since the last command finished (minus late foreign sentinel lines).
+   * Clears `lastStatus` first so a failed read yields no note rather than a stale
+   * one. A capless bridge resolves at once without touching the queue or socket.
+   */
+  readStatus(timeoutMs: number): Promise<StatusRead> {
+    if (!this.supports("status")) return Promise.resolve({ status: undefined, lines: [] });
+    this.lastStatusValue = undefined;
+    return this.enqueue(() => this.execStatusOnly(timeoutMs)).catch(() => ({
+      status: undefined,
+      lines: [],
+    }));
+  }
+
+  /**
+   * The bare `mcp_status <sentinel>` probe: unlike `execCommand`, the sentinel
+   * IS the entire wire text (no host command riding alongside it) — the line
+   * is self-correlating, so this needs no no-op command and makes no
+   * assumption about any other CCMD's zero-argument behavior.
+   *
+   * No `!socket` guard: unlike `execCommand`, this is only ever reached via
+   * `readStatus`, which already gated on `supports("status")` — a cap that
+   * is only ever set from a `hello` on a socket that has already connected.
+   */
+  private execStatusOnly(timeoutMs: number): Promise<StatusRead> {
+    const socket = this.socket!;
+    const id = (++this.seq).toString(36);
+    const sentinel = makeSentinel(id);
+    const lines = this.unclaimed.flatMap((t) => stripForeignSentinels(t, sentinel) ?? []);
+    this.unclaimed = [];
+    return new Promise<StatusRead>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending = undefined;
+        resolve({ status: undefined, lines });
+      }, timeoutMs);
+      // `dispatch` caches the status line's fields just before resolving.
+      const done = (output: string[]) => resolve({ status: this.lastStatusValue, lines: output });
+      this.pending = { sentinel, lines, resolve: done, reject, timer };
+      socket.write(encodeMessage({ v: PROTOCOL_VERSION, t: "cmd", text: statusRequest(sentinel) }));
     });
   }
 
@@ -178,6 +315,7 @@ export class BridgeClient extends EventEmitter {
   sendEvent(evtype: number, subtype: number, data1: number, data2 = 0): void {
     const socket = this.socket;
     if (!socket) throw new Error("Not connected");
+    this.events++;
     socket.write(encodeMessage({ v: PROTOCOL_VERSION, t: "event", evtype, subtype, data1, data2 }));
   }
 

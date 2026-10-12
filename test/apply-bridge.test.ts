@@ -36,7 +36,7 @@ function buildFixture(): string {
   writeFileSync(join(src, "d_main.cpp"),
     '#ifdef _WIN32\n#include <direct.h>\n#else\n#include <sys/stat.h>\n#endif\n#include "doomdef.h"\n#include "d_main.h"\n\nvoid D_DoomLoop ()\n{\n\tswitch ( NETWORK_GetState( ))\n\t{\n\t}\n}\n');
   writeFileSync(join(src, "c_console.cpp"),
-    '#include "templates.h"\n\nvoid C_Foo()\n{\n\tI_PrintStr (outlinecopy);\n}\n');
+    '#include "templates.h"\n\nvoid C_Foo()\n{\n\tI_PrintStr (outlinecopy);\n\t{\n\t\tC_AddNotifyString (printlevel, outlinecopy);\n\t\tmaybedrawnow (false, false);\n\t}\n}\n');
   writeFileSync(join(src, "v_text.cpp"),
     '#include "v_text.h"\n\nvoid DCanvas::DrawTextV (int normalcolor)\n{\n\tif (normalcolor >= NumTextColors)\n\t\tnormalcolor = 0;\n}\n');
   writeFileSync(join(src, "v_draw.cpp"),
@@ -156,6 +156,7 @@ describe("applyBridge", () => {
     assertAfter(join(src, "d_main.cpp"), /#include "doomdef.h"/, '#include "mcp_bridge.h"');
     assertBefore(join(src, "d_main.cpp"), /switch \( NETWORK_GetState/, "\t\t\tMCP_Bridge_Poll();");
     assertAfter(join(src, "c_console.cpp"), /I_PrintStr \(outlinecopy\)/, "\t\tMCP_Bridge_TeeOutput( outlinecopy );");
+    assertBefore(join(src, "c_console.cpp"), /C_AddNotifyString \(printlevel/, "\t\t\t\tif ( MCP_Bridge_ShowInNotify( outlinecopy ) )");
     assertBefore(join(src, "v_text.cpp"), /normalcolor >= NumTextColors/, "\tMCP_HUD_TeeText( x, y, string );");
     assertBefore(join(src, "v_draw.cpp"), /va_start\(tags, tags_first\)/, "\tMCP_HUD_TeeTexture( x, y, img );");
     assertAfter(join(src, "g_shared", "sbar.h"), /DetachAllMessages/, "\tvoid MCP_DumpMessages();");
@@ -173,10 +174,12 @@ describe("applyBridge", () => {
     const src = join(root, "src");
     applyBridge({ src: root, overlayDir });
     const before = linesOf(join(src, "d_main.cpp")).join("\n");
+    const consoleBefore = linesOf(join(src, "c_console.cpp")).join("\n");
 
     const log: string[] = [];
     applyBridge({ src: root, overlayDir, log: (m) => log.push(m) });
     expect(linesOf(join(src, "d_main.cpp")).join("\n")).toBe(before);
+    expect(linesOf(join(src, "c_console.cpp")).join("\n")).toBe(consoleBefore);
     expect(log.some((l) => l.includes("already patched"))).toBe(true);
   });
 

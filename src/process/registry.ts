@@ -141,6 +141,13 @@ export class InstanceRegistry {
     return this.clients.has(id);
   }
 
+  /** Peek at an instance's client without attaching, connecting, or throwing.
+   *  Used by the live-status wrapper, which must never open a socket or affect
+   *  whether a tool call succeeds or fails. */
+  find(id: number): BridgeClient | undefined {
+    return this.clients.get(id);
+  }
+
   /** Drop an instance's connection without touching its process. For letting go
    *  of a bridge that turned out not to be the engine we meant to talk to —
    *  killing it would be killing someone else's process. */

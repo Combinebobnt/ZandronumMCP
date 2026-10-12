@@ -288,7 +288,7 @@ namespace
 			// to the process it just spawned (and not a stale bridge on the same port).
 			char hello[256];
 			snprintf( hello, sizeof( hello ),
-				"{\"v\":1,\"t\":\"hello\",\"engine\":\"zandronum\",\"bridge\":\"0.4.0\",\"pid\":%d,\"caps\":[\"cmd\",\"event\",\"time\"]}",
+				"{\"v\":1,\"t\":\"hello\",\"engine\":\"zandronum\",\"bridge\":\"0.5.0\",\"pid\":%d,\"caps\":[\"cmd\",\"event\",\"time\",\"status\"]}",
 				mcp_getpid() );
 			SendLine( hello );
 
@@ -429,6 +429,11 @@ void MCP_Bridge_TeeOutput( const char *text )
 	json += esc;
 	json += "\"}";
 	SendLine( json );
+}
+
+bool MCP_Bridge_ShowInNotify( const char *text )
+{
+	return text == NULL || strncmp( text, "__MCPDONE_", 10 ) != 0;
 }
 
 void MCP_Bridge_Shutdown()

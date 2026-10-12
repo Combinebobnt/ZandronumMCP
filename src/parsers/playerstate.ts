@@ -1,3 +1,5 @@
+import type { EngineStatus } from "./status.js";
+
 export interface PlayerState {
   x: number;
   y: number;
@@ -6,12 +8,36 @@ export interface PlayerState {
   floorHeight: number;
   sector: number;
   light: number;
+  /** From the engine-state snapshot riding `currentpos`'s own sentinel.
+   *  Absent on a bridge without the `status` cap. */
+  health?: number;
+  armor?: number;
+  player?: "alive" | "dead" | "none";
+  spectating?: boolean;
 }
 
 export interface TargetInfo {
   target: string;
   health: number;
   spawnHealth: number;
+}
+
+/**
+ * Merge the health/armor/liveness fields from an `mcp_status` snapshot into a
+ * parsed `currentpos` result. A no-op (returns `state` unchanged) when
+ * `status` is `undefined` — a bridge with no `status` cap never populates
+ * `lastStatus`, so this is exactly how a legacy bridge stays fieldless here.
+ */
+export function withLiveStatus(state: PlayerState, status: EngineStatus | undefined): PlayerState {
+  if (!status) return state;
+  const merged: PlayerState = { ...state };
+  if (status.health !== undefined) merged.health = Number(status.health);
+  if (status.armor !== undefined) merged.armor = Number(status.armor);
+  if (status.player === "alive" || status.player === "dead" || status.player === "none") {
+    merged.player = status.player;
+  }
+  if (status.spectating !== undefined) merged.spectating = status.spectating === "1";
+  return merged;
 }
 
 const POS_RE =

@@ -202,6 +202,13 @@ export class ServerContext {
     return attach;
   }
 
+  /** Peek at an instance's client without attaching, connecting, or throwing —
+   *  see `InstanceRegistry.find`. Used by `registerLive` (tools.ts) so the
+   *  live-status wrapper can never itself open a socket or fail a tool call. */
+  attachedClient(instance: number): BridgeClient | undefined {
+    return this.registry.find(instance);
+  }
+
   /**
    * Read a map from a WAD/PK3, memoised so a slaughtermap is parsed once and
    * then sliced per query.
