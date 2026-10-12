@@ -1510,6 +1510,7 @@ describe("diagnostic tools", () => {
   });
 
   const written = new Date("2026-09-22T06:10:00Z");
+  const crashFile = path.join("/engine", "mcp-bridge-7777.log.crash");
   const crashReport = (pid: number) =>
     `=== MCP ENGINE CRASH ===\nsignal: 11 SIGSEGV\npid: ${pid}\n\nbacktrace:\n#0 R_DrawColumn`;
   const crashed = (pid: number) =>
@@ -1518,8 +1519,10 @@ describe("diagnostic tools", () => {
       {
         existsSync: () => true,
         readTextSync: () => crashReport(pid),
-        // Only the crash file has a write time, so a stat of any other path fails the call.
-        mtimeOf: (p) => (p === "/engine/mcp-bridge-7777.log.crash" ? written : new Date(NaN)),
+        mtimeOf: (p) => {
+          if (p !== crashFile) throw new Error(`unexpected mtimeOf ${p} in test`);
+          return written;
+        },
       },
     );
 
@@ -1533,7 +1536,7 @@ describe("diagnostic tools", () => {
     const h = await crashed(99);
     h.ctx.rememberEngine(1, 4242);
     expect(await h.text("get_crash")).toBe(
-      "No crash recorded for instance 1 (PID 4242). /engine/mcp-bridge-7777.log.crash holds " +
+      `No crash recorded for instance 1 (PID 4242). ${crashFile} holds ` +
         "another engine's crash (PID 99, written 2026-09-22T06:10:00.000Z), not this one's.",
     );
   });
