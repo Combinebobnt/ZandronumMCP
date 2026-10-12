@@ -14,17 +14,16 @@ import { cleanConsoleLines } from "./parsers/consoletext.js";
 import { parsePlayerState, parseTarget, withLiveStatus } from "./parsers/playerstate.js";
 import { pollUntil } from "./poll.js";
 import { parseActorState, parseActorsNear, parseFindActors, expandFlags } from "./parsers/actorstate.js";
-import { parsePlayers } from "./parsers/players.js";
-import { parseKvLines, firstError, hasHeader, failureText } from "./parsers/lines.js";
+import { parseKvLines, firstError, hasHeader, failureText, outputText } from "./parsers/lines.js";
 import { parseHud } from "./parsers/hud.js";
-import { describeStatus, statusBlockers } from "./parsers/status.js";
+import { describeStatus, statusBlockers, requireField } from "./parsers/status.js";
 import type { BridgeClient } from "./bridge/transport.js";
 import { findSymbol } from "./acs/symbols.js";
-import { collectAcsLumps, collectAcsModules } from "./acs/collect.js";
-import { parseBehaviorNames, parseMapExports, isAcsObject, parseLoadNames } from "./acs/bytecode.js";
-import { parseRunAcs } from "./parsers/runacs.js";
+import { collectAcsLumps, collectAcsModules, pickModules } from "./acs/collect.js";
+import { parseBehaviorNames, parseMapExports, isAcsObject, parseLoadNames, missingImports } from "./acs/bytecode.js";
+import { parseRunAcs, runAcsText } from "./parsers/runacs.js";
 import { parseRenderInfo, pick } from "./parsers/renderinfo.js";
-import { command, kvArgs, buildPuke, buildPukeName, buildRunAcs, buildSave } from "./commands/builders.js";
+import { command, kvArgs, realToken, buildPuke, buildPukeName, buildRunAcs, buildSave } from "./commands/builders.js";
 import { readSaveMeta } from "./saves/png.js";
 import {
   menuKeyEvent,
@@ -41,7 +40,7 @@ const acsScope = z.enum(["world", "global"]);
 const acsSrcArg = z.string().optional();
 const acsName = z.string().min(1);
 const mapFileArg = z.string().optional();
-const className = z.string().regex(/^\S+$/, "a class name has no spaces");
+const classArg = z.string().regex(/^\S+$/, "a class name has no spaces");
 // The engine's 16.16 fixed-point map coordinates wrap outside this range.
 const mapCoord = z.number().min(-32768).max(32767);
 
@@ -63,6 +62,8 @@ const CHEAT_POLL_MS = 100;
 const LIVE_PROBE_TICS = 5;
 // A status read a tool depends on waits out a map load before calling it a timeout.
 const STATUS_READ_MS = 3000;
+// Engine log lines `read_log` and `run_acs` return at most, unless asked otherwise.
+const LOG_LINES = 200;
 
 /** `step_until` comparisons. */
 const COMPARE = {
@@ -124,10 +125,18 @@ function profileCommand(sort?: string, limit?: number): string {
   return command("acsprofile", sort, ...(limit !== undefined ? [limit] : []));
 }
 
+/** An isError result carrying `text`. */
+function fail(text: string) {
+  return { isError: true, content: [{ type: "text" as const, text }] };
+}
+
 /** The isError result for a CCMD that gave no usable reply (see `failureText`). */
 function failed(output: string[]) {
-  return { isError: true, content: [{ type: "text" as const, text: failureText(output) }] };
+  return fail(failureText(output));
 }
+
+/** One live numeric read: the value, or why there is none. */
+type LiveRead = { value: number } | { error: string };
 
 /**
  * How often a slow tool reports that it's still working.
@@ -312,19 +321,31 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     if (pauseAfter) client.setPause(true);
   }
 
-  /** Why the last status snapshot lacks `field`, or undefined when it has it. */
-  function missingStatus(client: BridgeClient, field: string, hint = ""): string | undefined {
-    if (client.lastStatus?.[field] !== undefined) return undefined;
-    if (!client.supports("status")) return "this engine bridge has no status support (rebuild with the latest bridge)";
-    return client.lastStatus
-      ? `the engine's status snapshot has no ${field}= field (rebuild the engine with the latest overlay)${hint}`
-      : "status read timed out (engine busy, e.g. loading a map); retry";
+  /** The last status snapshot once it carries `field`, or why it doesn't. */
+  function statusField(client: BridgeClient, field: string, hint?: string) {
+    return requireField(client.lastStatus, client.supports("status"), field, hint);
   }
 
   /** `currentpos` plus the health/armor/liveness fields its own sentinel refreshed. */
   async function readPlayerState(client: BridgeClient) {
     const parsed = parsePlayerState(await client.runCommand("currentpos"));
     return parsed ? withLiveStatus(parsed, client.lastStatus) : null;
+  }
+
+  async function readMapVar(client: BridgeClient, name: string): Promise<LiveRead> {
+    const value = parseMapVar(await client.runCommand(command("getmapvar", name)));
+    return value === null ? { error: `map var '${name}' not found` } : { value };
+  }
+
+  async function readMapArray(client: BridgeClient, name: string, index: number): Promise<LiveRead> {
+    const value = parseMapArray(await client.runCommand(command("getmaparray", name, index)));
+    return value === null ? { error: `map array '${name}' not found` } : { value };
+  }
+
+  async function readAcsVar(client: BridgeClient, scope: string, index: number): Promise<LiveRead> {
+    const output = await client.runCommand(command("getacsvar", scope, index));
+    const vars = parseAcsVars(output);
+    return vars.length === 0 ? { error: output.join("\n") || "no value" } : { value: vars[0].value };
   }
 
   /** Both sides of a `step_until` condition, or why they can't be read. */
@@ -342,19 +363,13 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
       }
       return { left, right };
     }
-    let left: number | null;
-    if (c.kind === "mapvar") {
-      left = parseMapVar(await client.runCommand(command("getmapvar", c.name)));
-    } else if (c.kind === "maparray") {
-      left = parseMapArray(await client.runCommand(command("getmaparray", c.name, c.index)));
-    } else {
-      left = parseAcsVars(await client.runCommand(command("getacsvar", c.scope, c.index)))[0]?.value ?? null;
-    }
-    if (left === null) {
-      const what = c.kind === "acsvar" ? `${c.scope}[${c.index}]` : `map ${c.kind === "mapvar" ? "var" : "array"} '${c.name}'`;
-      return { error: `${what} not found` };
-    }
-    return { left, right: c.value };
+    const read =
+      c.kind === "mapvar"
+        ? await readMapVar(client, c.name)
+        : c.kind === "maparray"
+          ? await readMapArray(client, c.name, c.index)
+          : await readAcsVar(client, c.scope, c.index);
+    return "error" in read ? read : { left: read.value, right: c.value };
   }
 
   function postMenuKey(
@@ -446,7 +461,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
         "Run `mcp_spawnat`: spawn an actor at exact map x/y (each coordinate within -32768..32767; z defaults to the floor, angle in degrees, 0 east) and report it in the same call, even while paused (it thinks once the sim runs). The reply's class is the actual spawned class after any mod replacement (requested= shows the asked-for name when it differs); use it and the returned tid for follow-ups with find_actors/actor_state. tid defaults to a fresh unique TID; tid 0 means none. kind friend/foe matches summonfriend/summonfoe. The spawn is refused, reporting why, for an unknown class or a spot blocked by an actor, a line or the floor/ceiling fit; force skips that check. A point in the void is only caught by the floor/ceiling check here. health, special + args (up to 5, zero-padded), ambush and dormant are set at spawn time. Missile classes spawn inert.",
       inputSchema: {
         instance: instanceArg,
-        className,
+        className: classArg,
         x: mapCoord,
         y: mapCoord,
         z: mapCoord.optional(),
@@ -462,9 +477,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
       },
     },
     async ({ instance, className: cls, x, y, z: zPos, angle, tid, kind, force, health, special, args, ambush, dormant }) => {
-      if (args !== undefined && special === undefined) {
-        return { isError: true, content: [{ type: "text", text: "args needs special" }] };
-      }
+      if (args !== undefined && special === undefined) return fail("args needs special");
       const padded = args && [...args, 0, 0, 0, 0, 0].slice(0, 5).join(",");
       const kv = kvArgs({
         z: zPos,
@@ -479,7 +492,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
         dormant: dormant ? 1 : undefined,
       });
       const client = await ctx.clientFor(instance);
-      const output = await client.runCommand(command("mcp_spawnat", cls, String(x), String(y), ...kv));
+      const output = await client.runCommand(command("mcp_spawnat", cls, realToken(x), realToken(y), ...kv));
       const line = parseKvLines(output, "spawned")[0];
       if (!line) return failed(output);
       const spawned = expandFlags(line);
@@ -488,6 +501,45 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
         : "; no tid, so find it with find_actors(class) by position";
       const text = `spawned ${spawned.class} tid=${spawned.tid} at ${spawned.x},${spawned.y},${spawned.z}${hint}`;
       return { content: [{ type: "text", text }], structuredContent: { ...spawned } };
+    },
+  );
+
+  registerLive(
+    "set_cheat",
+    {
+      title: "Set a cheat on or off",
+      description:
+        "Idempotently turn a player cheat on or off. Reads the cheat bit from the engine-state snapshot and only runs the stock toggle CCMD (god, notarget, ...) when it differs, then waits for the bit to flip, so a blind toggle can never switch it the wrong way. Uses the engine's normal net path. Needs a bridge with the status cap and a cheats= field.",
+      inputSchema: {
+        instance: instanceArg,
+        name: z.enum(CHEAT_NAMES),
+        on: z.boolean(),
+      },
+    },
+    async ({ instance, name, on }) => {
+      const client = await ctx.clientFor(instance);
+      const bit = CHEATS[name];
+      const read = () => {
+        const cheats = client.lastStatus?.cheats;
+        return cheats === undefined ? undefined : (Number(cheats) & bit) !== 0;
+      };
+      await client.readStatus(STATUS_READ_MS);
+      const snapshot = statusField(client, "cheats", ", or there is no player");
+      if ("error" in snapshot) return fail(`can't read cheat state: ${snapshot.error}`);
+      const want = on ? "on" : "off";
+      if (read() === on) {
+        return { content: [{ type: "text", text: `${name} already ${want}; no change` }] };
+      }
+      const output = await client.runCommand(name);
+      const { value } = await pollUntil(read, (v) => v === on, {
+        waits: CHEAT_POLLS,
+        wait: async () => {
+          await sleep(CHEAT_POLL_MS);
+          await client.refreshStatus();
+        },
+      });
+      if (value !== on) return fail(`${name} did not turn ${want}; the engine said: ${outputText(output)}`);
+      return { content: [{ type: "text", text: `${name} ${want}` }] };
     },
   );
 
@@ -613,7 +665,6 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
       },
     },
     async ({ instance, source, script, args, compiler, includeDirs, open, stepTics }, extra) => {
-      const fail = (text: string) => ({ isError: true, content: [{ type: "text" as const, text }] });
       if (args !== undefined && script === undefined) return fail("args needs script");
       const client = await ctx.clientFor(instance);
       if (stepTics > 0 && !client.supports("time")) return fail(NO_TIME_CAP);
@@ -628,32 +679,26 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
         if (!isAcsObject(obj)) return fail(`${compiler} produced no ACS object; nothing sent to the engine`);
         const imports = parseLoadNames(obj);
         if (imports.length > 0) {
-          const loaded = new Set(parseModules(await client.runCommand("dumpmodules")).map((m) => m.name.toUpperCase()));
-          const missing = imports.filter((n) => !loaded.has(n.slice(0, 8).toUpperCase()));
+          const loaded = parseModules(await client.runCommand("dumpmodules")).map((m) => m.name);
+          const missing = missingImports(imports, loaded);
           if (missing.length > 0) {
             return fail(`imports ${missing.join(", ")}, not loaded in this level; nothing sent to the engine`);
           }
         }
         const run = script === undefined ? [] : [script, ...(args ?? [])];
-        output = await client.runCommand(buildRunAcs(built.token, ...run, ...(open ? ["open=1"] : [])));
+        output = await client.runCommand(buildRunAcs(built.token, ...run, ...kvArgs({ open: open ? 1 : undefined })));
       } finally {
         ctx.io.removeDir(built.dir);
       }
-      const reply = parseRunAcs(output);
-      if (!reply) return fail(output.join("\n").trim() || "(no output)");
-      const printed = output
-        .join("\n")
-        .split(/\r?\n/)
-        .map((l) => l.trimEnd())
-        .filter((l) => l.length > 0 && !l.startsWith("MCP_RUNACS "));
+      const result = parseRunAcs(output);
+      if (!result) return fail(outputText(output));
 
       let later: string[] | undefined;
       if (stepTics > 0) {
-        const logFile = ctx.logPathFor(instance);
-        const readLog = (sinceLine?: number) =>
-          logFile && ctx.io.existsSync(logFile)
-            ? readLogWindow(ctx.io.readTextSync(logFile), { sinceLine, maxLines: 200 })
-            : undefined;
+        const readLog = (sinceLine?: number) => {
+          const log = ctx.readLog(instance);
+          return log === undefined ? undefined : readLogWindow(log, { sinceLine, maxLines: LOG_LINES });
+        };
         const since = readLog()?.nextLine;
         await withProgress(extra, (stepTics / TICRATE) * 1000, `advancing ${stepTics} tic(s)`, () =>
           runTics(client, stepTics),
@@ -661,20 +706,9 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
         later = since === undefined ? undefined : readLog(since)?.lines.map((l) => l.text);
       }
 
-      const lines = [
-        `loaded snippet as module ${reply.module} (${reply.scripts} script(s)), started ${reply.started}`,
-        ...printed,
-      ];
-      if (stepTics > 0) {
-        lines.push(later ? `log after ${stepTics} tic(s):` : `ran ${stepTics} tic(s); no engine log to read`, ...(later ?? []));
-      }
-      if (reply.deferred) {
-        lines.push("The snippet has DEATH/ENTER/RESPAWN/... scripts: they fire on later events until the map changes.");
-      }
-      lines.push("save_game refuses until the map changes (a save now could not be loaded back); in-game saves and hub exits carry the same hazard.");
       return {
-        content: [{ type: "text", text: lines.join("\n") }],
-        structuredContent: { ...reply, output: printed, ...(later ? { log: later } : {}) },
+        content: [{ type: "text", text: runAcsText(result, stepTics, later) }],
+        structuredContent: { ...result.reply, output: result.printed, ...(later ? { log: later } : {}) },
       };
     },
   );
@@ -970,33 +1004,29 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
     async ({ instance, fix }) => {
       const client = await ctx.clientFor(instance);
-      if (!client.supports("time")) {
-        return { isError: true, content: [{ type: "text", text: NO_TIME_CAP }] };
-      }
+      if (!client.supports("time")) return fail(NO_TIME_CAP);
       await client.readStatus(STATUS_READ_MS);
       // A load finishing mid-probe resets maptime and reads as not live: let it run first.
       const waited = client.lastStatus?.pending === "1" && (await awaitLoad(client)).settled;
-      const missing = missingStatus(client, "maptime");
-      if (missing) {
-        return { isError: true, content: [{ type: "text", text: `can't check liveness: ${missing}` }] };
-      }
-      const found = statusBlockers(client.lastStatus!);
-      const wasPaused = client.lastStatus!.paused !== "0";
+      const first = statusField(client, "maptime");
+      if ("error" in first) return fail(`can't check liveness: ${first.error}`);
+      const found = statusBlockers(first.status);
+      const wasPaused = first.status.paused !== "0";
       if (fix) {
         await client.runCommand("closemenu");
         await client.runCommand("mcp_unblock");
       }
       // Fresh either way: the refresh above, or the last fix command's own sentinel.
-      const before = Number(client.lastStatus!.maptime);
+      const start = statusField(client, "maptime");
+      if ("error" in start) return fail(`can't check liveness: ${start.error}`);
+      const before = Number(start.status.maptime);
       await runTics(client, LIVE_PROBE_TICS, wasPaused);
       await client.readStatus(STATUS_READ_MS);
-      const lost = missingStatus(client, "maptime");
-      if (lost) {
-        return { isError: true, content: [{ type: "text", text: `can't check liveness: ${lost}` }] };
-      }
-      const after = Number(client.lastStatus!.maptime);
+      const end = statusField(client, "maptime");
+      if ("error" in end) return fail(`can't check liveness: ${end.error}`);
+      const after = Number(end.status.maptime);
       const live = after > before;
-      const remaining = statusBlockers(client.lastStatus!);
+      const remaining = statusBlockers(end.status);
       const fixed = fix ? found.filter((b) => !remaining.includes(b)) : undefined;
       const parts = [
         live ? `live (maptime ${before} -> ${after})` : `NOT live (maptime ${before} -> ${after})`,
@@ -1032,25 +1062,22 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
     async ({ instance, condition, maxTics, chunkTics }, extra) => {
       const client = await ctx.clientFor(instance);
-      if (!client.supports("time")) {
-        return { isError: true, content: [{ type: "text", text: NO_TIME_CAP }] };
-      }
+      if (!client.supports("time")) return fail(NO_TIME_CAP);
       // Every read is a command, whose own sentinel refreshes maptime for free.
-      let prev: number | undefined;
+      const maptime = () => Number(client.lastStatus?.maptime);
+      const first = await readCondition(client, condition);
+      const snapshot = statusField(client, "maptime");
+      if ("error" in snapshot) return fail(`can't count tics: ${snapshot.error}`);
+      const start = maptime();
+      let prev = start;
       let stalled = false;
       const read = async () => {
         const got = await readCondition(client, condition);
-        const now = Number(client.lastStatus?.maptime);
-        if (prev !== undefined && !(now > prev)) stalled = true;
+        const now = maptime();
+        if (!(now > prev)) stalled = true;
         prev = now;
         return got;
       };
-      const first = await read();
-      const missing = missingStatus(client, "maptime");
-      if (missing) {
-        return { isError: true, content: [{ type: "text", text: `can't count tics: ${missing}` }] };
-      }
-      const start = prev!;
       let stepped = 0;
       const test = (r: typeof first) => "error" in r || stalled || COMPARE[condition.op](r.left, r.right);
       const { value } = await withProgress(extra, (maxTics / TICRATE) * 1000, "stepping until condition", () =>
@@ -1063,21 +1090,13 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
           },
         }),
       );
-      if ("error" in value) return { isError: true, content: [{ type: "text", text: value.error }] };
-      const elapsed = prev! - start;
+      if ("error" in value) return fail(value.error);
+      const elapsed = prev - start;
       if (stalled) {
-        // Only refreshStatus/readStatus clear lastStatus, and nothing here calls them.
-        const blockers = statusBlockers(client.lastStatus!);
+        const blockers = statusBlockers(client.lastStatus);
         const why = blockers.length ? blockers.join(", ") : "no blocker reported";
-        return {
-          isError: true,
-          content: [
-            {
-              type: "text",
-              text: `the sim stopped advancing (maptime ${Number.isNaN(prev) ? "unreadable" : `stuck at ${prev}`}); ${why}. Try ensure_live with fix.`,
-            },
-          ],
-        };
+        const at = Number.isNaN(prev) ? "unreadable" : `stuck at ${prev}`;
+        return fail(`the sim stopped advancing (maptime ${at}); ${why}. Try ensure_live with fix.`);
       }
       const met = COMPARE[condition.op](value.left, value.right);
       const cmp = `${value.left} ${condition.op} ${value.right}`;
@@ -1103,14 +1122,11 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
     async ({ instance, scope, index }) => {
       const client = await ctx.clientFor(instance);
-      const output = await client.runCommand(command("getacsvar", scope, index));
-      const vars = parseAcsVars(output);
-      if (vars.length === 0) {
-        return { isError: true, content: [{ type: "text", text: output.join("\n") || "no value" }] };
-      }
+      const read = await readAcsVar(client, scope, index);
+      if ("error" in read) return fail(read.error);
       return {
-        content: [{ type: "text", text: String(vars[0].value) }],
-        structuredContent: { scope, index, value: vars[0].value },
+        content: [{ type: "text", text: String(read.value) }],
+        structuredContent: { scope, index, value: read.value },
       };
     },
   );
@@ -1239,17 +1255,10 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
     async ({ file, lump }) => {
       const all = collectAcsModules(ctx.io.readFileSync(file), path.basename(file));
-      const want = lump?.toLowerCase();
-      const picked = all.filter((m) => {
-        const full = m.name.toLowerCase();
-        return !want || full === want || path.basename(full).replace(/\.[^.]*$/, "") === want;
-      });
+      const picked = pickModules(all, lump);
       if (picked.length === 0) {
         const known = all.map((m) => m.name).join(", ") || "none";
-        return {
-          isError: true,
-          content: [{ type: "text", text: `No ACS module matches "${lump}" in ${file}. Modules: ${known}` }],
-        };
+        return fail(`No ACS module matches "${lump}" in ${file}. Modules: ${known}`);
       }
       const modules = picked.map((m) => ({ module: m.name, exports: parseMapExports(m.data) }));
       const text = modules
@@ -1298,31 +1307,19 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
     async ({ instance, name, description }) => {
       const client = await ctx.clientFor(instance);
-      // A run_acs module in the level makes the save unloadable (module-count I_Error).
-      // An exact read, so no bare MCP_STATUS line reaches the log; a timeout fails closed.
+      // A run_acs module makes the save unloadable (module-count I_Error), so this exact read
+      // (no bare MCP_STATUS line reaches the log) fails closed on a timeout.
       const { status } = await client.readStatus(STATUS_READ_MS);
       if (client.supports("status") && status === undefined) {
-        return {
-          isError: true,
-          content: [
-            {
-              type: "text",
-              text: "refused: status read timed out (engine busy, e.g. loading a map), so loaded run_acs snippets can't be ruled out; retry",
-            },
-          ],
-        };
+        return fail(
+          "refused: status read timed out (engine busy, e.g. loading a map), so loaded run_acs snippets can't be ruled out; retry",
+        );
       }
       const temp = status?.acstemp;
       if (temp !== undefined && temp !== "0") {
-        return {
-          isError: true,
-          content: [
-            {
-              type: "text",
-              text: `refused: ${temp} run_acs snippet module(s) are loaded, and loading a save taken now fails (ACS module count mismatch). Change or reload the map (load_map) first.`,
-            },
-          ],
-        };
+        return fail(
+          `refused: ${temp} run_acs snippet module(s) are loaded, and loading a save taken now fails (ACS module count mismatch). Change or reload the map (load_map) first.`,
+        );
       }
       const out = (await client.runCommand(buildSave(name, description))).join("\n");
       // `save` only queues the write (G_SaveGame sets sendsave), so "Game saved." prints a
@@ -1403,9 +1400,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
       },
     },
     async ({ instance, tid, index }) => {
-      if (index !== undefined && tid === undefined) {
-        return { isError: true, content: [{ type: "text", text: "index needs a tid" }] };
-      }
+      if (index !== undefined && tid === undefined) return fail("index needs a tid");
       const client = await ctx.clientFor(instance);
       const cmd =
         tid === undefined
@@ -1489,53 +1484,6 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
   );
 
   registerLive(
-    "set_cheat",
-    {
-      title: "Set a cheat on or off",
-      description:
-        "Idempotently turn a player cheat on or off. Reads the cheat bit from the engine-state snapshot and only runs the stock toggle CCMD (god, notarget, ...) when it differs, then waits for the bit to flip, so a blind toggle can never switch it the wrong way. Uses the engine's normal net path. Needs a bridge with the status cap and a cheats= field.",
-      inputSchema: {
-        instance: instanceArg,
-        name: z.enum(CHEAT_NAMES),
-        on: z.boolean(),
-      },
-    },
-    async ({ instance, name, on }) => {
-      const client = await ctx.clientFor(instance);
-      const bit = CHEATS[name];
-      const read = () => {
-        const cheats = client.lastStatus?.cheats;
-        return cheats === undefined ? undefined : (Number(cheats) & bit) !== 0;
-      };
-      await client.readStatus(STATUS_READ_MS);
-      const missing = missingStatus(client, "cheats", ", or there is no player");
-      if (missing) {
-        return { isError: true, content: [{ type: "text", text: `can't read cheat state: ${missing}` }] };
-      }
-      const want = on ? "on" : "off";
-      if (read() === on) {
-        return { content: [{ type: "text", text: `${name} already ${want}; no change` }] };
-      }
-      const output = await client.runCommand(name);
-      const { value } = await pollUntil(read, (v) => v === on, {
-        waits: CHEAT_POLLS,
-        wait: async () => {
-          await sleep(CHEAT_POLL_MS);
-          await client.refreshStatus();
-        },
-      });
-      if (value !== on) {
-        const said = output.join("\n").trim() || "(no output)";
-        return {
-          isError: true,
-          content: [{ type: "text", text: `${name} did not turn ${want}; the engine said: ${said}` }],
-        };
-      }
-      return { content: [{ type: "text", text: `${name} ${want}` }] };
-    },
-  );
-
-  registerLive(
     "set_view",
     {
       title: "Set the player's view",
@@ -1546,22 +1494,17 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
         angle: z.number().finite().optional(),
         pitch: z.number().finite().optional(),
         tid: z.number().int().min(1).optional(),
-        class: className.optional(),
+        class: classArg.optional(),
       },
     },
     async ({ instance, angle, pitch, tid, class: cls }) => {
       const modes = [angle, tid, cls].filter((m) => m !== undefined).length;
       if (modes !== 1 || (pitch !== undefined && angle === undefined)) {
-        return {
-          isError: true,
-          content: [
-            { type: "text", text: "give exactly one of angle, tid or class (pitch only with angle)" },
-          ],
-        };
+        return fail("give exactly one of angle, tid or class (pitch only with angle)");
       }
       const cmd =
         angle !== undefined
-          ? command("mcp_setview", String(angle), ...(pitch !== undefined ? [String(pitch)] : []))
+          ? command("mcp_setview", realToken(angle), ...(pitch !== undefined ? [realToken(pitch)] : []))
           : command("mcp_setview", ...kvArgs({ tid, class: cls }));
       const client = await ctx.clientFor(instance);
       const output = await client.runCommand(cmd);
@@ -1586,7 +1529,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
       const client = await ctx.clientFor(instance);
       const output = await client.runCommand("dumpplayers");
       if (!hasHeader(output, "MCP_PLAYERS")) return failed(output);
-      const players = parsePlayers(output);
+      const players = parseKvLines(output, "player");
       return {
         content: [{ type: "text", text: `${players.length} player(s)` }],
         structuredContent: { players },
@@ -1602,7 +1545,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
         "Run `findactors` and list map actors (owned inventory excluded), optionally filtered by class (includes subclasses), TID and radius around the player, sorted by distance. Each has class, tid, hp/spawnhp, x/y/z, angle, pitch, dist, sprite/frame, flags (monster, friendly, corpse, dormant, shootable, solid, invulnerable, ambush) and target. detail adds master/tracer, special + args, vel, radius/height, floorz and player index. With a tid filter each result also has index, the one to pass to actor_state(tid, index) for it (the list is in distance order, not index order).",
       inputSchema: {
         instance: instanceArg,
-        class: className.optional(),
+        class: classArg.optional(),
         tid: z.number().int().min(1).optional(),
         radius: z.number().int().positive().optional(),
         limit: z.number().int().positive().optional(),
@@ -1732,11 +1675,9 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
     async ({ instance, name }) => {
       const client = await ctx.clientFor(instance);
-      const value = parseMapVar(await client.runCommand(command("getmapvar", name)));
-      if (value === null) {
-        return { isError: true, content: [{ type: "text", text: `map var '${name}' not found` }] };
-      }
-      return { content: [{ type: "text", text: String(value) }], structuredContent: { name, value } };
+      const read = await readMapVar(client, name);
+      if ("error" in read) return fail(read.error);
+      return { content: [{ type: "text", text: String(read.value) }], structuredContent: { name, value: read.value } };
     },
   );
 
@@ -1769,13 +1710,11 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
     async ({ instance, name, index }) => {
       const client = await ctx.clientFor(instance);
-      const value = parseMapArray(await client.runCommand(command("getmaparray", name, index)));
-      if (value === null) {
-        return { isError: true, content: [{ type: "text", text: `map array '${name}' not found` }] };
-      }
+      const read = await readMapArray(client, name, index);
+      if ("error" in read) return fail(read.error);
       return {
-        content: [{ type: "text", text: String(value) }],
-        structuredContent: { name, index, value },
+        content: [{ type: "text", text: String(read.value) }],
+        structuredContent: { name, index, value: read.value },
       };
     },
   );
@@ -2179,19 +2118,12 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
       inputSchema: { instance: instanceArg },
     },
     async ({ instance }) => {
-      const logFile = ctx.logPathFor(instance);
-      if (!logFile || !ctx.io.existsSync(logFile)) {
-        return {
-          isError: true,
-          content: [
-            {
-              type: "text",
-              text: `No engine log for instance ${instance}. Launch it via launch_instance (which enables logging), then re-run this if it failed to start.`,
-            },
-          ],
-        };
+      const log = ctx.readLog(instance);
+      if (log === undefined) {
+        return fail(
+          `No engine log for instance ${instance}. Launch it via launch_instance (which enables logging), then re-run this if it failed to start.`,
+        );
       }
-      const log = ctx.io.readTextSync(logFile);
       const errors = parseStartupErrors(log);
       const body = errors.length
         ? `Detected ${errors.length} error line(s) in the engine log:\n\n${errors.join("\n")}`
@@ -2210,18 +2142,15 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
         instance: instanceArg,
         pattern: z.string().min(1).optional(),
         sinceLine: z.number().int().nonnegative().optional(),
-        maxLines: z.number().int().positive().default(200),
+        maxLines: z.number().int().positive().default(LOG_LINES),
       },
     },
     async ({ instance, pattern, sinceLine, maxLines }) => {
-      const logFile = ctx.logPathFor(instance);
-      if (!logFile || !ctx.io.existsSync(logFile)) {
-        return {
-          isError: true,
-          content: [{ type: "text", text: `No engine log for instance ${instance}. Launch it via launch_instance, which enables logging.` }],
-        };
+      const log = ctx.readLog(instance);
+      if (log === undefined) {
+        return fail(`No engine log for instance ${instance}. Launch it via launch_instance, which enables logging.`);
       }
-      const win = readLogWindow(ctx.io.readTextSync(logFile), { pattern, sinceLine, maxLines });
+      const win = readLogWindow(log, { pattern, sinceLine, maxLines });
       const head =
         `${win.lines.length} line(s), nextLine=${win.nextLine}` +
         (win.omitted ? `, ${win.omitted} more matching line(s) not shown` : "");

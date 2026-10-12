@@ -1,5 +1,14 @@
 import { describe, it, expect } from "vitest";
-import { command, buildPuke, buildPukeName, buildRunAcs, buildSave, UnsafeArgumentError } from "../src/commands/builders.js";
+import {
+  command,
+  kvArgs,
+  realToken,
+  buildPuke,
+  buildPukeName,
+  buildRunAcs,
+  buildSave,
+  UnsafeArgumentError,
+} from "../src/commands/builders.js";
 
 describe("command", () => {
   it("joins a verb with string and number tokens", () => {
@@ -16,6 +25,20 @@ describe("command", () => {
 
   it("rejects non-integer number tokens", () => {
     expect(() => command("give", "Clip", 1.5)).toThrow(UnsafeArgumentError);
+  });
+});
+
+describe("realToken / kvArgs", () => {
+  it("passes a fractional number and rejects a non-finite one", () => {
+    expect(command("mcp_setview", realToken(-12.5))).toBe("mcp_setview -12.5");
+    expect(() => realToken(NaN)).toThrow(UnsafeArgumentError);
+    expect(() => realToken(Infinity)).toThrow(UnsafeArgumentError);
+  });
+
+  it("builds key=value tokens in order, skipping undefined ones", () => {
+    expect(kvArgs({ z: 1.5, tid: undefined, kind: "foe", force: 1 })).toEqual(["z=1.5", "kind=foe", "force=1"]);
+    expect(kvArgs({})).toEqual([]);
+    expect(() => kvArgs({ angle: NaN })).toThrow(UnsafeArgumentError);
   });
 });
 

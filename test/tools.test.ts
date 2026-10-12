@@ -55,6 +55,12 @@ async function live(opts: LiveOptions = {}): Promise<Harness> {
   return harness;
 }
 
+/** `live()` on a status-capable bridge, with the fake's default all-normal snapshot. */
+const withStatus = (opts: LiveOptions = {}) => live({ ...opts, caps: ["cmd", "event", "time", "status"] });
+
+/** The text of every console command the fake bridge has received. */
+const cmds = () => bridge!.received.filter((m) => m.t === "cmd").map((m) => m.text ?? "");
+
 /** Wait for a fire-and-forget send to reach the fake bridge. */
 async function settle(done: () => boolean, tries = 100): Promise<void> {
   for (let i = 0; i < tries && !done(); i++) {
@@ -681,10 +687,6 @@ describe("live state tools", () => {
 });
 
 describe("test-session tools", () => {
-  const cmds = () => bridge!.received.filter((m) => m.t === "cmd").map((m) => m.text ?? "");
-  const withStatus = (opts: LiveOptions = {}) =>
-    live({ ...opts, caps: ["cmd", "event", "time", "status"] });
-
   it("drills into the nth actor sharing a TID, and needs a tid for index", async () => {
     const h = await live({ responses: { dumpactor: ["MCP_ACTOR", "class DoomImp", "pitch 5.0"] } });
     const res = await h.call("actor_state", { tid: 7, index: 2 });
@@ -947,13 +949,6 @@ describe("test-session tools", () => {
     });
   });
 
-  /** Empty the fake's status line, so the client's snapshot comes back undefined. */
-  const blankStatus = () => {
-    const keys = ["paused", "menu", "console", "gamestate", "player", "spectating", "demo", "automap"];
-    const more = ["health", "armor", "cheats", "maptime"];
-    bridge!.setStatus(Object.fromEntries([...keys, ...more].map((k) => [k, undefined])));
-  };
-
   /** Advance the fake's maptime by one on every command, status probes included. */
   const ticking = () => {
     let t = 0;
@@ -1002,12 +997,23 @@ describe("test-session tools", () => {
 
     it("asks for a retry, not a rebuild, when the second status read comes back empty", async () => {
       const h = await withStatus();
-      bridge!.onCommand("closemenu", blankStatus);
+      bridge!.onCommand("closemenu", () => bridge!.blankStatus());
       const res = await h.call("ensure_live", { fix: true });
       expect(res.isError).toBe(true);
       expect(res.content?.[0]?.text).toBe(
         "can't check liveness: status read timed out (engine busy, e.g. loading a map); retry",
       );
+    });
+
+    it("fails when a fix command's own status line comes back without maptime", async () => {
+      const h = await withStatus();
+      bridge!.onCommand("mcp_unblock", () => bridge!.setStatus({ maptime: undefined }));
+      const pauses = bridge!.pauses.length;
+      const res = await h.call("ensure_live", { fix: true });
+      // Caught before the probe: the sim was never unpaused.
+      expect(bridge!.pauses).toHaveLength(pauses);
+      expect(res.isError).toBe(true);
+      expect(res.content?.[0]?.text).toMatch(/^can't check liveness: the engine's status snapshot has no maptime= field/);
     });
 
     it("lists a load still pending after the wait as a blocker", async () => {
@@ -1146,9 +1152,10 @@ describe("test-session tools", () => {
       expect(await errText({ kind: "maparray", name: "a", index: 0, op: "==", value: 1 })).toBe(
         "map array 'a' not found",
       );
-      expect(await errText({ kind: "acsvar", scope: "world", index: 2, op: "==", value: 1 })).toBe(
-        "world[2] not found",
-      );
+      const acsvar = { kind: "acsvar", scope: "world", index: 2, op: "==", value: 1 };
+      expect(await errText(acsvar)).toBe("no value");
+      bridge!.respondTo("getacsvar", ["index out of range (0-255)"]);
+      expect(await errText(acsvar)).toBe("index out of range (0-255)");
       bridge!.setStatus({ armor: undefined });
       expect(await errText({ kind: "player", field: "z", op: "==", value: "armor" })).toMatch(/health\/armor/);
       bridge!.setStatus({ health: undefined });
@@ -1779,7 +1786,6 @@ describe("engine-state note (registerLive)", () => {
 });
 
 describe("run_acs", () => {
-  const cmds = () => bridge!.received.filter((m) => m.t === "cmd").map((m) => m.text ?? "");
   const REPLY = "MCP_RUNACS module=2 scripts=3 started=1 deferred=0";
   const OBJECT = buildBehaviorAcse([], []);
   const IMPORTING = readFileSync(new URL("./fixtures/runacs-import.o", import.meta.url));
@@ -1912,7 +1918,7 @@ describe("run_acs", () => {
   });
 
   it("makes save_game refuse while a snippet module is loaded", async () => {
-    const h = await live({ caps: ["cmd", "event", "time", "status"] });
+    const h = await withStatus();
     bridge!.setStatus({ acstemp: "2" });
     const res = await h.call("save_game", { name: "s1" });
     expect(res.isError).toBe(true);
@@ -1925,11 +1931,8 @@ describe("run_acs", () => {
   });
 
   it("makes save_game refuse when the status read comes back empty", async () => {
-    const h = await live({ caps: ["cmd", "event", "time", "status"] });
-    // Every field blank: the status line is a bare sentinel, which parses to no snapshot.
-    const keys = ["paused", "menu", "console", "gamestate", "player", "spectating", "demo", "automap"];
-    keys.push("health", "armor", "cheats", "maptime");
-    bridge!.setStatus(Object.fromEntries(keys.map((k) => [k, undefined])));
+    const h = await withStatus();
+    bridge!.blankStatus();
     const res = await h.call("save_game", { name: "s1" });
     expect(res.isError).toBe(true);
     expect(res.content?.[0]?.text).toMatch(/^refused: status read timed out/);

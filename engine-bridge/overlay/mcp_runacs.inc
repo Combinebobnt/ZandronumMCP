@@ -1,13 +1,6 @@
 // ==== MCP_RUNACS (overlay-appended to p_acs.cpp; not committed upstream) ====
 // Hot-load a compiled ACS object as a temporary module in the current level and
-// optionally start one of its scripts. Lives in p_acs.cpp for the file-static
-// P_GetScriptGoing. Offline only.
-//
-// StaticLoadModule is bypassed: it returns any module whose LumpNum matches, and
-// the map's own BEHAVIOR is -1. Each snippet gets a fresh LumpNum <= -2 instead,
-// which is also how mcp_status counts them (acstemp=). The constructor registers
-// the module before validating it and StaticModules is private, so a rejected
-// module can't be unloaded: it stays as an inert slot until the map changes.
+// optionally start one of its scripts (offline only; here for the file-static P_GetScriptGoing).
 static int MCP_RunAcsSerial = 0;
 
 static unsigned MCP_RunAcsModuleCount()
@@ -50,8 +43,11 @@ CCMD( mcp_runacs )
 	if ( !fr.Open( argv[1] ) ) { Printf( "error cannot open %s\n", argv[1] ); return; }
 
 	unsigned before = MCP_RunAcsModuleCount();
+	// A fresh LumpNum <= -2 (what mcp_status counts as acstemp=), since StaticLoadModule
+	// returns any module whose LumpNum matches and the map's own BEHAVIOR is -1.
 	FBehavior *b = new FBehavior( -2 - MCP_RunAcsSerial++, &fr, (int)fr.GetLength() );
-	// Every refusal below leaves the module registered (see the header comment).
+	// Every refusal below leaves an inert module loaded until the map changes: the
+	// constructor registers it before validating, and StaticModules is private.
 	if ( MCP_RunAcsModuleCount() != before + 1 )
 	{
 		Printf( "error imports a library that is not loaded in this level (modules left loaded until the map changes)\n" );
@@ -77,8 +73,8 @@ CCMD( mcp_runacs )
 		if ( p->Type != SCRIPT_Closed && p->Type != SCRIPT_Open ) deferred = true;
 	}
 
-	// Run inside this call (as runNow does) so Log() lands in the reply. Offline,
-	// the console player is never predicted, so no unpredict is needed here.
+	// Run inside this call (as runNow does) so Log() lands in the reply; offline the
+	// console player is never predicted, so no unpredict is needed.
 	AActor *activator = playeringame[consoleplayer] ? players[consoleplayer].mo : NULL;
 	if ( open ) b->StartTypedScripts( SCRIPT_Open, NULL, false, 0, true );
 	if ( code != NULL )

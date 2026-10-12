@@ -11,7 +11,6 @@ import {
   removeDir,
   type CompileDeps,
 } from "../src/acs/compile.js";
-import { parseRunAcs } from "../src/parsers/runacs.js";
 
 /** A POSIX-style fixture path as compileAcs resolves it on this OS (`C:\\opt\\bcc` on Windows). */
 const abs = (p: string) => path.resolve(p);
@@ -21,8 +20,8 @@ const DIR = abs("/tmp/mcp-runacs-x");
 const at = (file: string) => path.join(DIR, file);
 
 /**
- * Deps that record writes and exec calls; `fail` makes exec throw it. `files` are executables
- * unless listed in `plain`; `path` is PATH; `links` maps a path to its realpath.
+ * Deps that record writes and exec calls: `fail` makes exec throw it, `files` are executables
+ * unless listed in `plain`, `path` is PATH, and `links` maps a path to its realpath.
  */
 function fakeDeps(
   opts: {
@@ -354,21 +353,5 @@ describe("compiler lookup", () => {
     expect(defaultCompileDeps.pathEnv()).toBe(process.env.PATH);
     expect(defaultCompileDeps.exeExts).toEqual(pathExts(process.platform));
     removeDir(dir);
-  });
-});
-
-describe("parseRunAcs", () => {
-  it("parses the reply line among the script's own output", () => {
-    expect(parseRunAcs(["runacs ok", "MCP_RUNACS module=3 scripts=2 started=named deferred=1"])).toEqual({
-      module: 3,
-      scripts: 2,
-      started: "named",
-      deferred: true,
-    });
-    expect(parseRunAcs(["MCP_RUNACS module=0 scripts=1 started=none deferred=0"])?.deferred).toBe(false);
-  });
-
-  it("returns undefined without a reply line", () => {
-    expect(parseRunAcs(["error netgame"])).toBeUndefined();
   });
 });

@@ -1,12 +1,7 @@
+import path from "node:path";
 import { parseWad } from "../map/wad.js";
 import { isZip, listZipEntries, readZipEntry } from "../map/zip.js";
-
-// ACS bytecode magics: "ACS\0", "ACSE", "ACSe".
-const ACS_MAGICS = new Set([0x00534341, 0x45534341, 0x65534341]);
-
-function looksLikeAcs(buf: Buffer): boolean {
-  return buf.length >= 4 && ACS_MAGICS.has(buf.readUInt32LE(0));
-}
+import { hasAcsMagic } from "./bytecode.js";
 
 export interface AcsModule {
   /** Zip entry name, `<wad>:<map marker>` for a map BEHAVIOR, or the caller's raw-file name. */
@@ -37,15 +32,24 @@ function behaviorModules(wadBuf: Buffer, prefix: string): AcsModule[] {
  * work on a source-less mod, where the scripts live in a compiled library.
  */
 export function collectAcsModules(buffer: Buffer, rawName = "BEHAVIOR"): AcsModule[] {
-  if (looksLikeAcs(buffer)) return [{ name: rawName, data: buffer }]; // a raw compiled .o / BEHAVIOR file
+  if (hasAcsMagic(buffer)) return [{ name: rawName, data: buffer }]; // a raw compiled .o / BEHAVIOR file
   if (!isZip(buffer)) return behaviorModules(buffer, "");
   const out: AcsModule[] = [];
   for (const entry of listZipEntries(buffer)) {
     const data = readZipEntry(buffer, entry);
-    if (looksLikeAcs(data)) out.push({ name: entry.name, data });
+    if (hasAcsMagic(data)) out.push({ name: entry.name, data });
     else if (entry.name.toLowerCase().endsWith(".wad")) out.push(...behaviorModules(data, `${entry.name}:`));
   }
   return out;
+}
+
+/** The modules whose name or extension-less basename is `lump` (case-insensitive), or all of them without one. */
+export function pickModules(modules: AcsModule[], lump?: string): AcsModule[] {
+  const want = lump?.toLowerCase();
+  return modules.filter((m) => {
+    const full = m.name.toLowerCase();
+    return !want || full === want || path.basename(full).replace(/\.[^.]*$/, "") === want;
+  });
 }
 
 /** Just the bytecode buffers of `collectAcsModules`, for callers that pool names across modules. */

@@ -1,5 +1,25 @@
 import { describe, it, expect } from "vitest";
-import { parseActorState, parseActorsNear } from "../src/parsers/actorstate.js";
+import { parseActorState, parseActorsNear, parseFindActors } from "../src/parsers/actorstate.js";
+
+describe("parseFindActors", () => {
+  it("expands flag letters, ignoring unknown and '-' ones", () => {
+    const found = parseFindActors([
+      "MCP_FOUND",
+      "found class=DoomImp tid=5 hp=60 flags=msoz target=player0",
+      "found class=Column tid=0 hp=1000 flags=-",
+      "found class=Odd tid=0",
+    ]);
+    expect(found.actors[0]).toMatchObject({ class: "DoomImp", flags: "monster,shootable,solid", target: "player0" });
+    expect(found.actors[1].flags).toBe("");
+    expect(found.actors[2].flags).toBeUndefined();
+    expect(found.truncated).toBeUndefined();
+  });
+
+  it("reports truncation", () => {
+    const found = parseFindActors(["found class=A tid=0", "truncated shown=1 total=9"]);
+    expect(found.truncated).toEqual({ shown: 1, total: 9 });
+  });
+});
 
 describe("parseActorState", () => {
   const out = [

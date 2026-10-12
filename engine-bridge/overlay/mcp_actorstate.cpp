@@ -1,8 +1,9 @@
 //
-// mcp_actorstate.cpp -- read-only DECORATE/actor state inspection (overlay file).
+// mcp_actorstate.cpp -- DECORATE/actor state inspection (overlay file).
 // Dumps an actor's live state: class, health, position, current DECORATE state
 // (sprite/frame/tics, e.g. "TNT1 A 0"), inventory chain, and -- for players --
-// ready weapon and morph status. Plus the actors near the player. All reads.
+// ready weapon and morph status. Plus the actors near the player. All reads,
+// except the test-session CCMDs (mcp_setview, mcp_unblock, mcp_spawnat).
 //
 #include "doomtype.h"
 #include "c_dispatch.h"
@@ -112,8 +113,8 @@ static bool MCP_LoadPending( )
 	}
 }
 
-// Temp modules mcp_runacs loaded into the current level (LumpNum <= -2, see
-// mcp_runacs.inc). Nonzero means a save would I_Error on load.
+// Temp modules mcp_runacs loaded into this level (LumpNum <= -2), any of which
+// makes a save I_Error on load.
 static int MCP_RunAcsModules()
 {
 	int n = 0;
@@ -197,9 +198,8 @@ CCMD( mcp_status )
 	Printf( "%s\n", line );
 }
 
-// --- test-session CCMDs: mcp_setview / dumpplayers / findactors / mcp_spawnat
-// Listing output is "<tag> key=value ..." with name= always last (names can
-// hold spaces), so a caller parses every line with one generic key=value reader.
+// --- test-session CCMDs, whose listing lines are "<tag> key=value ..." with
+// name= always last (names can hold spaces), so one generic reader parses them all.
 
 static double MCP_Deg( int bam ) { return bam / double( ANGLE_1 ); }
 
@@ -225,27 +225,22 @@ static double MCP_Dist2D( AActor *a, AActor *b )
 	return sqrt( dx * dx + dy * dy );
 }
 
-// Parses "key=N" out of argv; returns false if no such key was given.
-static bool MCP_IntArg( FCommandLine &argv, const char *key, int &out )
-{
-	size_t len = strlen( key );
-	for ( int i = 1; i < argv.argc(); i++ )
-	{
-		if ( strncmp( argv[i], key, len ) == 0 && argv[i][len] == '=' )
-		{
-			out = atoi( argv[i] + len + 1 );
-			return true;
-		}
-	}
-	return false;
-}
-
+// The value of "key=value" in argv, or NULL if no such key was given.
 static const char *MCP_StrArg( FCommandLine &argv, const char *key )
 {
 	size_t len = strlen( key );
 	for ( int i = 1; i < argv.argc(); i++ )
 		if ( strncmp( argv[i], key, len ) == 0 && argv[i][len] == '=' ) return argv[i] + len + 1;
 	return NULL;
+}
+
+// Parses "key=N" out of argv; returns false if no such key was given.
+static bool MCP_IntArg( FCommandLine &argv, const char *key, int &out )
+{
+	const char *v = MCP_StrArg( argv, key );
+	if ( v == NULL ) return false;
+	out = atoi( v );
+	return true;
 }
 
 // Parses "key=N" as a fractional number; returns false if the key is absent.
@@ -334,8 +329,7 @@ CCMD( mcp_setview )
 	Printf( "%s\n", line.GetChars() );
 }
 
-// Clears what eats input without a stock CCMD to close it: console, chat, automap.
-// The menu has `closemenu`; the pause flag has the bridge's setpause message.
+// Clears what eats input and has no stock CCMD to close it: console, chat, automap.
 CCMD( mcp_unblock )
 {
 	C_HideConsole();
@@ -498,7 +492,7 @@ static FString MCP_BlockReason( AActor *a )
 
 // mcp_spawnat <class> <x> <y> [z=N] [angle=N] [tid=N|auto] [kind=friend|foe] [force=1]
 //   [health=N] [special=N] [args=a,b,c,d,e] [ambush=1] [dormant=1]
-// Spawns directly (no net command), so the reply reports the new actor. z defaults
+// Spawns directly (no net command), so the reply reports the new actor; z defaults
 // to the floor, angle is in degrees, tid defaults to a fresh unique TID.
 CCMD( mcp_spawnat )
 {

@@ -75,16 +75,17 @@ export function parseBehaviorNames(lump: Buffer): BytecodeNames {
   };
 }
 
-/** Whether a buffer is loadable ACS bytecode at all (FBehavior's magic + 32-byte floor). */
-export function isAcsObject(lump: Buffer): boolean {
-  return lump.length >= 32 && lump.toString("latin1", 0, 3) === "ACS" && [0, 0x45, 0x65].includes(lump[3]);
+/** Whether a buffer starts with one of the ACS bytecode magics. */
+export function hasAcsMagic(buf: Buffer): boolean {
+  return buf.length >= 4 && [MAGIC_ACS0, MAGIC_ACSE, MAGIC_ACSe].includes(buf.readUInt32LE(0));
 }
 
-/**
- * Libraries an object imports: the LOAD chunk, NUL-separated names (p_acs.cpp,
- * "Load required libraries"). The engine looks each up as an ACS library lump,
- * so these match `dumpmodules` names case-insensitively.
- */
+/** Whether a buffer is loadable ACS bytecode at all (FBehavior's magic + 32-byte floor). */
+export function isAcsObject(lump: Buffer): boolean {
+  return lump.length >= 32 && hasAcsMagic(lump);
+}
+
+/** Libraries an object imports: the LOAD chunk's NUL-separated names (p_acs.cpp, "Load required libraries"). */
 export function parseLoadNames(lump: Buffer): string[] {
   const region = locateChunks(lump);
   if (!region) return [];
@@ -92,6 +93,12 @@ export function parseLoadNames(lump: Buffer): string[] {
   if (load < 0) return [];
   const size = lump.readUInt32LE(load + 4);
   return lump.toString("latin1", load + 8, load + 8 + size).split("\0").filter((n) => n.length > 0);
+}
+
+/** The imports none of the `loaded` module names satisfies, matched as the engine does: 8-character lump names, case-insensitively. */
+export function missingImports(imports: string[], loaded: string[]): string[] {
+  const have = new Set(loaded.map((n) => n.toUpperCase()));
+  return imports.filter((n) => !have.has(n.slice(0, 8).toUpperCase()));
 }
 
 export interface MapExport {
@@ -104,8 +111,8 @@ export interface MapExport {
 }
 
 /**
- * Exported map variables and arrays: the only names get_map_var/get_map_array can
- * see. MEXP is a name chunk; ARAY is [slot][size] pairs (p_acs.cpp, "Create arrays").
+ * Exported map variables and arrays, the only names get_map_var/get_map_array can see:
+ * MEXP is a name chunk, ARAY is [slot][size] pairs (p_acs.cpp, "Create arrays").
  */
 export function parseMapExports(lump: Buffer): MapExport[] {
   const region = locateChunks(lump);

@@ -1,12 +1,29 @@
 import { describe, it, expect } from "vitest";
-import { matchLines, parseKv, parseKvLines, firstError } from "../src/parsers/lines.js";
-import { parsePlayers } from "../src/parsers/players.js";
-import { parseFindActors } from "../src/parsers/actorstate.js";
+import {
+  matchLines,
+  kvPairs,
+  parseKv,
+  parseKvLines,
+  firstError,
+  hasHeader,
+  outputText,
+  failureText,
+} from "../src/parsers/lines.js";
 
 describe("matchLines", () => {
   it("splits multi-line chunks, trims, and maps only matching lines", () => {
     const got = matchLines(["  a 1\r\nb 2", "a 3"], /^a (\d)$/, (m) => Number(m[1]));
     expect(got).toEqual([1, 3]);
+  });
+});
+
+describe("kvPairs", () => {
+  it("splits each token at its first '=' and skips tokens with no key", () => {
+    expect(kvPairs(["a=1", "b=c=d", "bare", "=x", "e="])).toEqual([
+      ["a", "1"],
+      ["b", "c=d"],
+      ["e", ""],
+    ]);
   });
 });
 
@@ -31,40 +48,42 @@ describe("parseKvLines / firstError", () => {
     ]);
   });
 
+  it("returns one record per `dumpplayers` line, with only the fields the engine printed", () => {
+    const players = parseKvLines(
+      [
+        "MCP_PLAYERS",
+        "player slot=0 bot=0 spec=0 deadspec=0 state=live hp=100 cheats=2 ping=0 name=Player",
+        "player slot=1 bot=1 spec=0 deadspec=0 state=live cheats=0 ping=0 name=Doom Guy",
+      ],
+      "player",
+    );
+    expect(players).toHaveLength(2);
+    expect(players[1]).toMatchObject({ slot: 1, bot: 1, name: "Doom Guy" });
+    expect(players[1].hp).toBeUndefined();
+  });
+
   it("finds the first error line, or none", () => {
     expect(firstError(["ok", "error no actor with tid 5", "error later"])).toBe("no actor with tid 5");
     expect(firstError(["ok"])).toBeUndefined();
   });
 });
 
-describe("parsePlayers", () => {
-  it("returns one record per player line", () => {
-    const players = parsePlayers([
-      "MCP_PLAYERS",
-      "player slot=0 bot=0 spec=0 deadspec=0 state=live hp=100 cheats=2 ping=0 name=Player",
-      "player slot=1 bot=1 spec=0 deadspec=0 state=live cheats=0 ping=0 name=Doom Guy",
-    ]);
-    expect(players).toHaveLength(2);
-    expect(players[1]).toMatchObject({ slot: 1, bot: 1, name: "Doom Guy" });
+describe("hasHeader", () => {
+  it("needs the header on a line of its own", () => {
+    expect(hasHeader(["noise\nMCP_FOUND", "found class=A"], "MCP_FOUND")).toBe(true);
+    expect(hasHeader(["MCP_FOUND extra", "xMCP_FOUND"], "MCP_FOUND")).toBe(false);
   });
 });
 
-describe("parseFindActors", () => {
-  it("expands flag letters, ignoring unknown and '-' ones", () => {
-    const found = parseFindActors([
-      "MCP_FOUND",
-      "found class=DoomImp tid=5 hp=60 flags=msoz target=player0",
-      "found class=Column tid=0 hp=1000 flags=-",
-      "found class=Odd tid=0",
-    ]);
-    expect(found.actors[0]).toMatchObject({ class: "DoomImp", flags: "monster,shootable,solid", target: "player0" });
-    expect(found.actors[1].flags).toBe("");
-    expect(found.actors[2].flags).toBeUndefined();
-    expect(found.truncated).toBeUndefined();
+describe("outputText / failureText", () => {
+  it("joins what was printed, or says nothing was", () => {
+    expect(outputText(["a", "b\n"])).toBe("a\nb");
+    expect(outputText([" ", ""])).toBe("(no output)");
   });
 
-  it("reports truncation", () => {
-    const found = parseFindActors(["found class=A tid=0", "truncated shown=1 total=9"]);
-    expect(found.truncated).toEqual({ shown: 1, total: 9 });
+  it("prefers the CCMD's error line over the rest of its output", () => {
+    expect(failureText(["noise", "error unknown class Imp"])).toBe("unknown class Imp");
+    expect(failureText(["Unknown command"])).toBe("Unknown command");
+    expect(failureText([])).toBe("(no output)");
   });
 });

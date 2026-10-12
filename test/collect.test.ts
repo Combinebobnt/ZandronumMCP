@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { collectAcsLumps, collectAcsModules } from "../src/acs/collect.js";
+import { collectAcsLumps, collectAcsModules, pickModules } from "../src/acs/collect.js";
 import { parseBehaviorNames } from "../src/acs/bytecode.js";
 import { buildWad, buildZip } from "./fakes/wad-builder.js";
 import { buildBehaviorAcse } from "./fakes/acs-builder.js";
@@ -70,5 +70,21 @@ describe("collectAcsModules", () => {
       { name: "maps/MAP01.wad", data: inner },
     ]);
     expect(collectAcsModules(pk3).map((m) => m.name)).toEqual(["acs/lib.o", "maps/MAP01.wad:MAP01"]);
+  });
+});
+
+describe("pickModules", () => {
+  const modules = ["acs/MyMod.o", "maps/MAP01.wad:MAP01"].map((name) => ({ name, data: Buffer.alloc(0) }));
+  const names = (lump?: string) => pickModules(modules, lump).map((m) => m.name);
+
+  it("keeps every module without a lump", () => {
+    expect(names()).toHaveLength(2);
+  });
+
+  it("matches a full name or an extension-less basename, case-insensitively", () => {
+    expect(names("mymod")).toEqual(["acs/MyMod.o"]);
+    expect(names("ACS/MYMOD.O")).toEqual(["acs/MyMod.o"]);
+    expect(names("maps/map01.wad:map01")).toEqual(["maps/MAP01.wad:MAP01"]);
+    expect(names("other")).toEqual([]);
   });
 });

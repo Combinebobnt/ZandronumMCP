@@ -137,6 +137,12 @@ export class FakeBridge {
     return this;
   }
 
+  /** Empty the status line to a bare sentinel, so the client's snapshot comes back undefined. */
+  blankStatus(): this {
+    this.status = {};
+    return this;
+  }
+
   /** Reset the received-message log, so a test can count only the wire traffic
    *  from the call it's actually asserting on — after setup traffic (e.g.
    *  `live()`'s own `attach_instance` refresh) has already landed. */

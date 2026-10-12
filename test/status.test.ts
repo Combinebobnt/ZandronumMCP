@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseStatus, describeStatus } from "../src/parsers/status.js";
+import { parseStatus, describeStatus, statusBlockers, requireField } from "../src/parsers/status.js";
 
 const SENTINEL = "__MCPDONE_a1__";
 
@@ -106,5 +106,40 @@ describe("describeStatus", () => {
       automap: "0",
     };
     expect(describeStatus(status)).toBeUndefined();
+  });
+});
+
+describe("statusBlockers", () => {
+  it("lists what stops the sim or eats input, leaving out paused, demorec and acstemp", () => {
+    const status = { paused: "1", menu: "on", chat: "1", demorec: "1", pending: "1", acstemp: "2" };
+    expect(statusBlockers(status)).toEqual([
+      "a menu is open",
+      "chat input is open",
+      "a map/save/demo load is pending",
+    ]);
+  });
+
+  it("has nothing to list without a snapshot", () => {
+    expect(statusBlockers(undefined)).toEqual([]);
+  });
+});
+
+describe("requireField", () => {
+  it("hands back the snapshot when it carries the field", () => {
+    const status = { maptime: "7" };
+    expect(requireField(status, true, "maptime")).toEqual({ status });
+  });
+
+  it("names a bridge without the status cap, a missing field (with the hint) and a timed-out read", () => {
+    expect(requireField(undefined, false, "maptime")).toEqual({
+      error: "this engine bridge has no status support (rebuild with the latest bridge)",
+    });
+    expect(requireField({ paused: "0" }, true, "cheats", ", or there is no player")).toEqual({
+      error:
+        "the engine's status snapshot has no cheats= field (rebuild the engine with the latest overlay), or there is no player",
+    });
+    expect(requireField(undefined, true, "maptime")).toEqual({
+      error: "status read timed out (engine busy, e.g. loading a map); retry",
+    });
   });
 });

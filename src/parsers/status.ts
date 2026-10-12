@@ -3,6 +3,7 @@
  * command's correlator sentinel (see `correlation/sentinel.ts`). Pure — no
  * `BridgeClient` reference — so it's testable without a socket.
  */
+import { kvPairs } from "./lines.js";
 
 export type EngineStatus = Record<string, string>;
 
@@ -16,13 +17,7 @@ export type EngineStatus = Record<string, string>;
 export function parseStatus(line: string, sentinel: string): EngineStatus | undefined {
   const tokens = line.trim().split(/\s+/);
   if (tokens[0] !== sentinel || tokens.length < 2) return undefined;
-  const fields: EngineStatus = {};
-  for (const tok of tokens.slice(1)) {
-    const eq = tok.indexOf("=");
-    if (eq <= 0) continue;
-    fields[tok.slice(0, eq)] = tok.slice(eq + 1);
-  }
-  return fields;
+  return Object.fromEntries(kvPairs(tokens.slice(1)));
 }
 
 interface StatusRow {
@@ -88,11 +83,27 @@ export function describeStatus(status: EngineStatus): string | undefined {
   return phrases.length ? `Engine state: ${phrases.join(", ")}.` : undefined;
 }
 
-/** The unusual conditions that can keep a driven sim from advancing or eat its input,
- *  worded as in `describeStatus`. Leaves out `paused` (the normal driving state), `demorec`
- *  and `acstemp`. */
-export function statusBlockers(status: EngineStatus): string[] {
+/** The unusual conditions that can stop a driven sim or eat its input, worded as in
+ *  `describeStatus`: every row but `paused` (the normal driving state), `demorec` and `acstemp`. */
+export function statusBlockers(status: EngineStatus | undefined): string[] {
+  if (!status) return [];
   return unusualRows(status)
     .filter((u) => u.row.blocker !== false)
     .map((u) => u.note);
+}
+
+/** The snapshot once it carries `field`, or why it doesn't (`supported` is the bridge's status cap). */
+export function requireField(
+  status: EngineStatus | undefined,
+  supported: boolean,
+  field: string,
+  hint = "",
+): { status: EngineStatus } | { error: string } {
+  if (status?.[field] !== undefined) return { status };
+  if (!supported) return { error: "this engine bridge has no status support (rebuild with the latest bridge)" };
+  return {
+    error: status
+      ? `the engine's status snapshot has no ${field}= field (rebuild the engine with the latest overlay)${hint}`
+      : "status read timed out (engine busy, e.g. loading a map); retry",
+  };
 }

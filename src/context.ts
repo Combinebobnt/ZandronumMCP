@@ -164,6 +164,12 @@ export class ServerContext {
       : undefined;
   }
 
+  /** An instance's engine console log text, or undefined when there is none to read. */
+  readLog(instance: number): string | undefined {
+    const logFile = this.logPathFor(instance);
+    return logFile && this.io.existsSync(logFile) ? this.io.readTextSync(logFile) : undefined;
+  }
+
   /**
    * Lazily attach to instance N on first use.
    *

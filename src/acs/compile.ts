@@ -3,15 +3,7 @@ import { tmpdir } from "node:os";
 import { accessSync, constants, existsSync, mkdtempSync, realpathSync, statSync, writeFileSync, rmSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 
-/**
- * Host-side compile of a `run_acs` snippet into a temp dir the engine can read.
- *
- * A snippet that isn't a `#library` gets one via a wrapper file: a non-library
- * object leaves its string indices untagged, so once loaded as module N > 0 its
- * `Log(s:"...")` reads module 0's string table instead (live-confirmed). The
- * wrapper `#include`s the snippet so diagnostics keep the snippet's line numbers
- * (acc refuses a `#library` after anything else, so it can't just be appended).
- */
+/** Host-side compile of a `run_acs` snippet into a temp dir the engine can read. */
 
 export type AcsCompiler = "bcc" | "acc";
 
@@ -23,7 +15,7 @@ export interface CompileRequest {
   includeDirs?: string[];
 }
 
-/** A failure names the executable that ran, if one was found. `token` is `object` as a console token. */
+/** `token` is `object` as a console token; a failure names the executable that ran, if one was found. */
 export type CompileResult =
   | { ok: true; dir: string; object: string; token: string }
   | { ok: false; dir: string; diagnostics: string; exe?: string };
@@ -59,7 +51,7 @@ export function findOnPath(
   isExec: (p: string) => boolean,
 ): string | undefined {
   for (const entry of (envPath ?? "").split(path.delimiter).filter(Boolean)) {
-    // Windows PATH entries may be quoted. Resolved: the compiler runs with the temp dir as its cwd.
+    // Unquoted (Windows PATH entries may be quoted) and resolved, since the compiler runs in the temp dir.
     const dir = entry.replace(/^"(.*)"$/, "$1");
     const hit = withExts(path.resolve(dir, name), exts).find(isExec);
     if (hit) return hit;
@@ -133,8 +125,8 @@ function locate(req: CompileRequest, deps: CompileDeps): { exe: string; real: st
 }
 
 /**
- * zt-bcc's `lib/` beside or one above the real binary, unless includeDirs already reaches
- * zcommon.acs. zt-bcc finds the beside case itself; one above covers a binary in `build/`.
+ * zt-bcc's `lib/` beside the real binary or one folder above it (a binary in `build/`),
+ * unless includeDirs already reaches zcommon.acs.
  */
 function bccLibDir(real: string, includeDirs: string[], deps: CompileDeps): string | undefined {
   const has = (d: string) => deps.exists(path.join(d, "zcommon.acs"));
@@ -160,7 +152,8 @@ function diagnosticsOf(err: unknown, compiler: AcsCompiler, exe: string): string
 
 /**
  * `p` as one console token, or why not: a bare token ends at a byte <= 0x20 (UTF-8 too, where char is signed) and
- * expands a leading `$`; quoted, `\"` `\\` `\c` are escapes. Windows gets `/` separators and no non-ASCII (ANSI fopen).
+ * expands a leading `$`, a quoted one reads `\"` `\\` `\c` as escapes, and Windows gets `/` separators and no
+ * non-ASCII (ANSI fopen).
  */
 export function consolePath(p: string, platform: NodeJS.Platform = process.platform): { token: string } | { refused: string } {
   const s = platform === "win32" ? p.replaceAll("\\", "/") : p;
@@ -192,6 +185,8 @@ export function compileAcs(req: CompileRequest, deps: CompileDeps = defaultCompi
   if ("missing" in found) return { ok: false, dir, diagnostics: found.missing };
   deps.writeFile(path.join(dir, "snippet.acs"), req.source);
   let main = "snippet.acs";
+  // A non-library object's string indices are untagged, so as module N > 0 its `Log(s:"...")` reads module 0's
+  // strings (live-confirmed); the wrapper `#include`s the snippet, which keeps its line numbers in diagnostics.
   if (!LIBRARY.test(req.source)) {
     main = "wrap.acs";
     deps.writeFile(path.join(dir, main), '#library "mcpsnip"\n#include "snippet.acs"\n');

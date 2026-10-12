@@ -45,9 +45,8 @@ export interface LogWindow {
 }
 
 /**
- * A filtered slice of an engine console log, minus the sentinel plumbing every
- * tool call writes. Only complete lines count: a half-flushed last line is left
- * for the next read, so `nextLine` never skips the rest of it.
+ * A filtered slice of an engine console log, minus the sentinel plumbing every tool call
+ * writes, counting only complete lines so `nextLine` never skips the rest of a half-flushed one.
  */
 export function readLogWindow(log: string, opts: LogWindowOptions): LogWindow {
   const raw = log.split(/\r?\n/).slice(0, -1);
