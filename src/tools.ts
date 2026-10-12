@@ -832,9 +832,11 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     async ({ instance, name, description }) => {
       const client = await ctx.clientFor(instance);
       const out = (await client.runCommand(buildSave(name, description))).join("\n");
+      // `save` only queues the write (G_SaveGame sets sendsave), so "Game saved." prints a
+      // tic after this reply; every rejection prints in-call.
       return {
-        isError: !/game saved/i.test(out),
-        content: [{ type: "text", text: out.trim() || "(no output)" }],
+        isError: out.trim().length > 0 && !/game saved/i.test(out),
+        content: [{ type: "text", text: out.trim() || "save queued; confirm with list_saves" }],
       };
     },
   );
