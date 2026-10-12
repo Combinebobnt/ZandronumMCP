@@ -79,3 +79,25 @@ export function crashReportPid(report: string): number | undefined {
   const m = /^pid: (\d+)\r?$/m.exec(report);
   return m ? Number(m[1]) : undefined;
 }
+
+/** What get_crash says about a crash file that exists: the file outlives its engine, so only a report whose pid line matches this instance's engine is returned as its crash. */
+export function crashReportText(crash: {
+  instance: number;
+  crashFile: string;
+  report: string;
+  enginePid: number | undefined;
+  written: Date;
+}): string {
+  const { instance, crashFile, report, enginePid } = crash;
+  const reportPid = crashReportPid(report);
+  if (enginePid !== undefined && reportPid === enginePid) return report;
+  const written = crash.written.toISOString();
+  if (enginePid !== undefined && reportPid !== undefined) {
+    return (
+      `No crash recorded for instance ${instance} (PID ${enginePid}). ${crashFile} holds an ` +
+      `earlier engine's crash (PID ${reportPid}, written ${written}), not this one's.`
+    );
+  }
+  const why = enginePid === undefined ? "this instance's engine PID is unknown" : "the report has no pid line";
+  return `Unverified: ${why}, so this may be an earlier engine's crash (written ${written}).\n\n${report}`;
+}

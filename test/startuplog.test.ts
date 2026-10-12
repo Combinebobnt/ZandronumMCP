@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseStartupErrors, tailLines, crashLogPath, readLogWindow, crashReportPid } from "../src/process/startuplog.js";
+import { parseStartupErrors, tailLines, crashLogPath, readLogWindow, crashReportPid, crashReportText } from "../src/process/startuplog.js";
 
 const SAMPLE = [
   "Resolving GL extensions",
@@ -99,5 +99,33 @@ describe("crashReportPid", () => {
     expect(crashReportPid("=== MCP ENGINE CRASH ===\nsignal: 11 SIGSEGV\nfault_addr: 0x8\npid: 31337\n\nbacktrace:\n")).toBe(31337);
     expect(crashReportPid("code: 0xc0000005\r\npid: 7\r\n")).toBe(7);
     expect(crashReportPid("no pid here\n#0 pid: 5 in a frame")).toBeUndefined();
+  });
+});
+
+describe("crashReportText", () => {
+  const withPid = "signal: 11 SIGSEGV\npid: 99\n\nbacktrace:\n#0 R_DrawColumn";
+  const reply = (report: string, enginePid: number | undefined) =>
+    crashReportText({ instance: 2, crashFile: "/x/inst2.log.crash", report, enginePid, written: new Date("2026-09-22T06:10:00Z") });
+
+  it("returns the report verbatim when its pid is this engine's", () => {
+    expect(reply(withPid, 99)).toBe(withPid);
+  });
+
+  it("names another engine's report without returning it", () => {
+    expect(reply(withPid, 4242)).toBe(
+      "No crash recorded for instance 2 (PID 4242). /x/inst2.log.crash holds an earlier engine's crash (PID 99, written 2026-09-22T06:10:00.000Z), not this one's.",
+    );
+  });
+
+  it("marks the report unverified when the engine PID is unknown", () => {
+    expect(reply(withPid, undefined)).toBe(
+      `Unverified: this instance's engine PID is unknown, so this may be an earlier engine's crash (written 2026-09-22T06:10:00.000Z).\n\n${withPid}`,
+    );
+  });
+
+  it("marks the report unverified when it has no pid line", () => {
+    expect(reply("SIGSEGV\n#0 x", 4242)).toBe(
+      "Unverified: the report has no pid line, so this may be an earlier engine's crash (written 2026-09-22T06:10:00.000Z).\n\nSIGSEGV\n#0 x",
+    );
   });
 });
