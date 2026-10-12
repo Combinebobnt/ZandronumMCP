@@ -22,7 +22,7 @@ export function stubIo(overrides: Partial<ContextIo> = {}): ContextIo {
     readTextSync: nope("readTextSync"),
     readdirSync: nope("readdirSync"),
     stampOf: () => "stamp",
-    mtimeOf: () => new Date("2026-09-22T06:10:00Z"),
+    mtimeOf: nope("mtimeOf"),
     sleep: () => Promise.resolve(), // tests never wait on real time
     // One deterministic tick instead of a real interval, so progress reporting
     // is exercised without the clock.

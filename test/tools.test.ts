@@ -1509,15 +1509,19 @@ describe("diagnostic tools", () => {
     expect(await h.text("get_crash")).toMatch(/No crash recorded/);
   });
 
-  const crashReport = (pid: number) => `=== MCP ENGINE CRASH ===\nsignal: 11 SIGSEGV\npid: ${pid}\n\nbacktrace:\n#0 R_DrawColumn`;
-  const crashed = (pid: number) => offline({ exe: "/engine/zandronum" }, { existsSync: () => true, readTextSync: () => crashReport(pid) });
-
-  it("marks the report unverified while the instance's engine PID is unknown", async () => {
-    const h = await crashed(4242);
-    expect(await h.text("get_crash")).toBe(
-      `Unverified: this instance's engine PID is unknown, so this may be an earlier engine's crash (written 2026-09-22T06:10:00.000Z).\n\n${crashReport(4242)}`,
+  const written = new Date("2026-09-22T06:10:00Z");
+  const crashReport = (pid: number) =>
+    `=== MCP ENGINE CRASH ===\nsignal: 11 SIGSEGV\npid: ${pid}\n\nbacktrace:\n#0 R_DrawColumn`;
+  const crashed = (pid: number) =>
+    offline(
+      { exe: "/engine/zandronum" },
+      {
+        existsSync: () => true,
+        readTextSync: () => crashReport(pid),
+        // Only the crash file has a write time, so a stat of any other path fails the call.
+        mtimeOf: (p) => (p === "/engine/mcp-bridge-7777.log.crash" ? written : new Date(NaN)),
+      },
     );
-  });
 
   it("returns the report verbatim when its pid matches this instance's engine", async () => {
     const h = await crashed(4242);
@@ -1525,11 +1529,39 @@ describe("diagnostic tools", () => {
     expect(await h.text("get_crash")).toBe(crashReport(4242));
   });
 
-  it("names an earlier engine's report instead of returning it", async () => {
+  it("names another engine's report instead of returning it", async () => {
     const h = await crashed(99);
     h.ctx.rememberEngine(1, 4242);
     expect(await h.text("get_crash")).toBe(
-      "No crash recorded for instance 1 (PID 4242). /engine/mcp-bridge-7777.log.crash holds an earlier engine's crash (PID 99, written 2026-09-22T06:10:00.000Z), not this one's.",
+      "No crash recorded for instance 1 (PID 4242). /engine/mcp-bridge-7777.log.crash holds " +
+        "another engine's crash (PID 99, written 2026-09-22T06:10:00.000Z), not this one's.",
+    );
+  });
+
+  it("stops matching the previous engine's PID once a relaunch fails", async () => {
+    bridge = await FakeBridge.start({ hello: { v: 1, t: "hello", engine: "fake", pid: 4242 } });
+    let bridgeOpens = true;
+    harness = await startHarness({
+      config: { exe: "/engine/zandronum", basePort: bridge.port },
+      io: {
+        existsSync: () => true,
+        readTextSync: () => crashReport(4242),
+        mtimeOf: () => written,
+        launchIo: {
+          spawn: () => ({ pid: undefined, kill: () => {} }),
+          waitForPort: () =>
+            bridgeOpens ? Promise.resolve() : Promise.reject(new Error("timeout")),
+          clearQuarantine: () => {},
+        },
+      },
+    });
+    await harness.call("launch_instance");
+    expect(await harness.text("get_crash")).toBe(crashReport(4242));
+
+    bridgeOpens = false;
+    expect((await harness.call("launch_instance")).isError).toBe(true);
+    expect(await harness.text("get_crash")).toMatch(
+      /^Unverified: this instance's engine PID is unknown/,
     );
   });
 });

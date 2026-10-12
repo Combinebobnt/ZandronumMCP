@@ -1,5 +1,6 @@
 import { describe, it, expect, afterEach } from "vitest";
 import path from "node:path";
+import { statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { ServerContext, defaultContextIo, type ServerConfig } from "../src/context.js";
@@ -276,7 +277,7 @@ describe("defaultContextIo", () => {
     expect(defaultContextIo.readTextSync(here)).toContain("defaultContextIo");
     expect(defaultContextIo.readdirSync(path.dirname(here))).toContain("context.test.ts");
     expect(defaultContextIo.stampOf(here)).toMatch(/^\d+(\.\d+)?:\d+$/);
-    expect(defaultContextIo.mtimeOf(here).getTime()).toBeGreaterThan(0);
+    expect(defaultContextIo.mtimeOf(here)).toEqual(statSync(here).mtime);
     await expect(defaultContextIo.sleep(0)).resolves.toBeUndefined();
     const ticks = await new Promise<number>((resolve) => {
       let n = 0;

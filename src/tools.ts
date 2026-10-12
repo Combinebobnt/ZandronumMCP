@@ -3,7 +3,13 @@ import type { ZodRawShapeCompat } from "@modelcontextprotocol/sdk/server/zod-com
 import { z } from "zod";
 import path from "node:path";
 import type { ServerContext } from "./context.js";
-import { parseStartupErrors, tailLines, crashLogPath, readLogWindow, crashReportText } from "./process/startuplog.js";
+import {
+  parseStartupErrors,
+  tailLines,
+  crashLogPath,
+  readLogWindow,
+  crashReportText,
+} from "./process/startuplog.js";
 import { parseDumpActors } from "./parsers/dumpactors.js";
 import { parseScriptStat } from "./parsers/scriptstat.js";
 import { parseAcsVars } from "./parsers/acsvars.js";
@@ -2164,7 +2170,7 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     {
       title: "Get the last engine crash backtrace",
       description:
-        "Return the signal, faulting address, and symbolized backtrace the bridge's crash handler captured the last time the engine crashed (segfault/abort/bus error/etc.). Use this when an instance dies unexpectedly — e.g. run_command reports the bridge closed. A report left by an earlier engine (different PID) is named but not returned as this instance's crash; one that can't be tied to this engine (its PID is unknown, or the report has no pid line) is returned marked `Unverified:`.",
+        "Return the signal, faulting address, and symbolized backtrace the bridge's crash handler captured the last time the engine crashed (segfault/abort/bus error/etc.). Use this when an instance dies unexpectedly — e.g. run_command reports the bridge closed. A report left by another engine (different PID) is named but not returned as this instance's crash; one that can't be tied to this engine (its PID is unknown, or the report has no pid line) is returned marked `Unverified:`.",
       inputSchema: { instance: instanceArg },
     },
     async ({ instance }) => {

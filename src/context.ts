@@ -138,6 +138,8 @@ export class ServerContext {
   rememberLaunch(instance: number, port: number, logFile: string): void {
     this.boundPorts.set(instance, port);
     this.logFiles.set(instance, logFile);
+    // A new engine is starting, so the last one's PID no longer names this instance.
+    this.enginePids.delete(instance);
   }
 
   /** Record which process an instance's bridge belongs to, once it says so. */
