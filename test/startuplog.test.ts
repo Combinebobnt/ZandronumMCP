@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseStartupErrors, tailLines, crashLogPath } from "../src/process/startuplog.js";
+import { parseStartupErrors, tailLines, crashLogPath, readLogWindow } from "../src/process/startuplog.js";
 
 const SAMPLE = [
   "Resolving GL extensions",
@@ -49,5 +49,47 @@ describe("crashLogPath", () => {
   it("derives <log>.crash from the console-log path (matches mcp_crash.cpp)", () => {
     expect(crashLogPath("/x/mcp-bridge-7777.log")).toBe("/x/mcp-bridge-7777.log.crash");
     expect(crashLogPath("C:/tmp/inst1.log")).toBe("C:/tmp/inst1.log.crash");
+  });
+});
+
+describe("readLogWindow", () => {
+  const LOG = ["one", "__MCPDONE_1__", "Degreelessness Mode ON", "", "two", "partial"].join("\n");
+
+  it("tails the last maxLines, skipping sentinels, blanks and a half-written last line", () => {
+    expect(readLogWindow(LOG, { maxLines: 2 })).toEqual({
+      lines: [
+        { line: 3, text: "Degreelessness Mode ON" },
+        { line: 5, text: "two" },
+      ],
+      nextLine: 5,
+      omitted: 1,
+    });
+  });
+
+  it("filters by a case-insensitive pattern", () => {
+    expect(readLogWindow(LOG, { pattern: "degreeless", maxLines: 10 }).lines).toEqual([
+      { line: 3, text: "Degreelessness Mode ON" },
+    ]);
+  });
+
+  it("reads forward from sinceLine, resuming at the last line returned when capped", () => {
+    expect(readLogWindow(LOG, { sinceLine: 1, maxLines: 1 })).toEqual({
+      lines: [{ line: 3, text: "Degreelessness Mode ON" }],
+      nextLine: 3,
+      omitted: 1,
+    });
+    expect(readLogWindow(LOG, { sinceLine: 3, maxLines: 5 })).toEqual({
+      lines: [{ line: 5, text: "two" }],
+      nextLine: 5,
+      omitted: 0,
+    });
+  });
+
+  it("returns nothing past the end (a relaunch overwrote the log)", () => {
+    expect(readLogWindow(LOG, { sinceLine: 99, maxLines: 5 })).toEqual({ lines: [], nextLine: 5, omitted: 0 });
+  });
+
+  it("throws on an invalid pattern", () => {
+    expect(() => readLogWindow(LOG, { pattern: "(", maxLines: 5 })).toThrow();
   });
 });

@@ -3,7 +3,7 @@ import type { ZodRawShapeCompat } from "@modelcontextprotocol/sdk/server/zod-com
 import { z } from "zod";
 import path from "node:path";
 import type { ServerContext } from "./context.js";
-import { parseStartupErrors, tailLines, crashLogPath } from "./process/startuplog.js";
+import { parseStartupErrors, tailLines, crashLogPath, readLogWindow } from "./process/startuplog.js";
 import { parseDumpActors } from "./parsers/dumpactors.js";
 import { parseScriptStat } from "./parsers/scriptstat.js";
 import { parseAcsVars } from "./parsers/acsvars.js";
@@ -13,15 +13,17 @@ import { parseAcsProfile } from "./parsers/acsprofile.js";
 import { cleanConsoleLines } from "./parsers/consoletext.js";
 import { parsePlayerState, parseTarget, withLiveStatus } from "./parsers/playerstate.js";
 import { pollUntil } from "./poll.js";
-import { parseActorState, parseActorsNear } from "./parsers/actorstate.js";
+import { parseActorState, parseActorsNear, parseFindActors, expandFlags } from "./parsers/actorstate.js";
+import { parseKvLines, firstError, hasHeader, failureText, outputText } from "./parsers/lines.js";
 import { parseHud } from "./parsers/hud.js";
-import { describeStatus } from "./parsers/status.js";
+import { describeStatus, statusBlockers, requireField } from "./parsers/status.js";
 import type { BridgeClient } from "./bridge/transport.js";
 import { findSymbol } from "./acs/symbols.js";
-import { collectAcsLumps } from "./acs/collect.js";
-import { parseBehaviorNames } from "./acs/bytecode.js";
+import { collectAcsLumps, collectAcsModules, pickModules } from "./acs/collect.js";
+import { parseBehaviorNames, parseMapExports, isAcsObject, parseLoadNames, missingImports } from "./acs/bytecode.js";
+import { parseRunAcs, runAcsText } from "./parsers/runacs.js";
 import { parseRenderInfo, pick } from "./parsers/renderinfo.js";
-import { command, buildPuke, buildPukeName, buildSave } from "./commands/builders.js";
+import { command, kvArgs, realToken, buildPuke, buildPukeName, buildRunAcs, buildSave } from "./commands/builders.js";
 import { readSaveMeta } from "./saves/png.js";
 import {
   menuKeyEvent,
@@ -38,6 +40,78 @@ const acsScope = z.enum(["world", "global"]);
 const acsSrcArg = z.string().optional();
 const acsName = z.string().min(1);
 const mapFileArg = z.string().optional();
+const classArg = z.string().regex(/^\S+$/, "a class name has no spaces");
+// The engine's 16.16 fixed-point map coordinates wrap outside this range.
+const mapCoord = z.number().min(-32768).max(32767);
+
+/** `set_cheat` names: each is its own stock toggle CCMD, keyed to its `CF_*` bit (d_player.h). */
+const CHEATS = {
+  noclip: 1 << 0,
+  god: 1 << 1,
+  notarget: 1 << 3,
+  fly: 1 << 4,
+  buddha: 1 << 27,
+  noclip2: 1 << 30,
+} as const;
+const CHEAT_NAMES = Object.keys(CHEATS) as [keyof typeof CHEATS, ...(keyof typeof CHEATS)[]];
+// A queued cheat lands on the next tic; about 2s of polling covers a busy frame.
+const CHEAT_POLLS = 20;
+const CHEAT_POLL_MS = 100;
+
+// Tics `ensure_live` runs the sim for to see `maptime` move.
+const LIVE_PROBE_TICS = 5;
+// A status read a tool depends on waits out a map load before calling it a timeout.
+const STATUS_READ_MS = 3000;
+// Engine log lines `read_log` and `run_acs` return at most, unless asked otherwise.
+const LOG_LINES = 200;
+
+/** `step_until` comparisons. */
+const COMPARE = {
+  "==": (a: number, b: number) => a === b,
+  "!=": (a: number, b: number) => a !== b,
+  "<": (a: number, b: number) => a < b,
+  "<=": (a: number, b: number) => a <= b,
+  ">": (a: number, b: number) => a > b,
+  ">=": (a: number, b: number) => a >= b,
+} as const;
+const compareOp = z.enum(Object.keys(COMPARE) as [keyof typeof COMPARE, ...(keyof typeof COMPARE)[]]);
+const PLAYER_FIELDS = [
+  "x",
+  "y",
+  "z",
+  "angle",
+  "floorHeight",
+  "sector",
+  "light",
+  "health",
+  "armor",
+] as const;
+const playerField = z.enum(PLAYER_FIELDS);
+const conditionArg = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("mapvar"), name: acsName, op: compareOp, value: z.number() }),
+  z.object({
+    kind: z.literal("maparray"),
+    name: acsName,
+    index: z.number().int().min(0),
+    op: compareOp,
+    value: z.number(),
+  }),
+  z.object({
+    kind: z.literal("acsvar"),
+    scope: acsScope,
+    index: z.number().int().min(0),
+    op: compareOp,
+    value: z.number(),
+  }),
+  z.object({
+    kind: z.literal("player"),
+    field: playerField,
+    op: compareOp,
+    // A second field compares against the same live read, e.g. z == floorHeight.
+    value: z.union([z.number(), playerField]),
+  }),
+]);
+type Condition = z.infer<typeof conditionArg>;
 
 const MENU_KEYS = ["up", "down", "left", "right", "enter", "back", "backspace"] as const;
 
@@ -50,6 +124,19 @@ function profileCommand(sort?: string, limit?: number): string {
   if (!sort) return "acsprofile";
   return command("acsprofile", sort, ...(limit !== undefined ? [limit] : []));
 }
+
+/** An isError result carrying `text`. */
+function fail(text: string) {
+  return { isError: true, content: [{ type: "text" as const, text }] };
+}
+
+/** The isError result for a CCMD that gave no usable reply (see `failureText`). */
+function failed(output: string[]) {
+  return fail(failureText(output));
+}
+
+/** One live numeric read: the value, or why there is none. */
+type LiveRead = { value: number } | { error: string };
 
 /**
  * How often a slow tool reports that it's still working.
@@ -206,6 +293,13 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
   async function runLoad(client: BridgeClient, cmd: string): Promise<string[]> {
     const out = await client.runCommand(cmd);
     if (!client.supports("status")) return cleanConsoleLines(out);
+    const { settled, printed } = await awaitLoad(client);
+    const caveat = settled ? [] : ["(load still pending after ~5 s; the engine-state note may predate it)"];
+    return [...cleanConsoleLines([...out, ...printed]), ...caveat];
+  }
+
+  /** Poll status until no load is pending (bounded, ~5 s), keeping what the engine printed meanwhile. */
+  async function awaitLoad(client: BridgeClient): Promise<{ settled: boolean; printed: string[] }> {
     const printed: string[] = [];
     // A snapshot with no pending= field (an older overlay) counts as settled.
     const read = async () => {
@@ -217,8 +311,65 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
       waits: LOAD_WAITS,
       wait: () => sleep(LOAD_WAIT_MS),
     });
-    const caveat = settled ? [] : ["(load still pending after ~5 s; the engine-state note may predate it)"];
-    return [...cleanConsoleLines([...out, ...printed]), ...caveat];
+    return { settled, printed };
+  }
+
+  /** Unpause for `tics`, then pause again unless `pauseAfter` is false. */
+  async function runTics(client: BridgeClient, tics: number, pauseAfter = true): Promise<void> {
+    client.setPause(false);
+    await sleep((tics / TICRATE) * 1000);
+    if (pauseAfter) client.setPause(true);
+  }
+
+  /** The last status snapshot once it carries `field`, or why it doesn't. */
+  function statusField(client: BridgeClient, field: string, hint?: string) {
+    return requireField(client.lastStatus, client.supports("status"), field, hint);
+  }
+
+  /** `currentpos` plus the health/armor/liveness fields its own sentinel refreshed. */
+  async function readPlayerState(client: BridgeClient) {
+    const parsed = parsePlayerState(await client.runCommand("currentpos"));
+    return parsed ? withLiveStatus(parsed, client.lastStatus) : null;
+  }
+
+  async function readMapVar(client: BridgeClient, name: string): Promise<LiveRead> {
+    const value = parseMapVar(await client.runCommand(command("getmapvar", name)));
+    return value === null ? { error: `map var '${name}' not found` } : { value };
+  }
+
+  async function readMapArray(client: BridgeClient, name: string, index: number): Promise<LiveRead> {
+    const value = parseMapArray(await client.runCommand(command("getmaparray", name, index)));
+    return value === null ? { error: `map array '${name}' not found` } : { value };
+  }
+
+  async function readAcsVar(client: BridgeClient, scope: string, index: number): Promise<LiveRead> {
+    const output = await client.runCommand(command("getacsvar", scope, index));
+    const vars = parseAcsVars(output);
+    return vars.length === 0 ? { error: output.join("\n") || "no value" } : { value: vars[0].value };
+  }
+
+  /** Both sides of a `step_until` condition, or why they can't be read. */
+  async function readCondition(
+    client: BridgeClient,
+    c: Condition,
+  ): Promise<{ left: number; right: number } | { error: string }> {
+    if (c.kind === "player") {
+      const state = await readPlayerState(client);
+      if (!state) return { error: "no player (not in a level?)" };
+      const left = state[c.field];
+      const right = typeof c.value === "number" ? c.value : state[c.value];
+      if (left === undefined || right === undefined) {
+        return { error: "health/armor need a bridge with the status cap" };
+      }
+      return { left, right };
+    }
+    const read =
+      c.kind === "mapvar"
+        ? await readMapVar(client, c.name)
+        : c.kind === "maparray"
+          ? await readMapArray(client, c.name, c.index)
+          : await readAcsVar(client, c.scope, c.index);
+    return "error" in read ? read : { left: read.value, right: c.value };
   }
 
   function postMenuKey(
@@ -286,7 +437,8 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     "summon",
     {
       title: "Summon actor",
-      description: "Spawn an actor of the given class at the player's position.",
+      description:
+        "Spawn an actor of the given class at the player's position (use summon_at for exact map coordinates).",
       inputSchema: {
         instance: instanceArg,
         className: z.string().min(1),
@@ -298,6 +450,96 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
       const client = await ctx.clientFor(instance);
       const output = await client.runCommand(command(verb, className));
       return { content: [{ type: "text", text: output.join("\n") || `summoned ${className}` }] };
+    },
+  );
+
+  registerLive(
+    "summon_at",
+    {
+      title: "Summon actor at coordinates",
+      description:
+        "Run `mcp_spawnat`: spawn an actor at exact map x/y (each coordinate within -32768..32767; z defaults to the floor, angle in degrees, 0 east) and report it in the same call, even while paused (it thinks once the sim runs). The reply's class is the actual spawned class after any mod replacement (requested= shows the asked-for name when it differs); use it and the returned tid for follow-ups with find_actors/actor_state. tid defaults to a fresh unique TID; tid 0 means none. kind friend/foe matches summonfriend/summonfoe. The spawn is refused, reporting why, for an unknown class or a spot blocked by an actor, a line or the floor/ceiling fit; force skips that check. A point in the void is only caught by the floor/ceiling check here. health, special + args (up to 5, zero-padded), ambush and dormant are set at spawn time. Missile classes spawn inert.",
+      inputSchema: {
+        instance: instanceArg,
+        className: classArg,
+        x: mapCoord,
+        y: mapCoord,
+        z: mapCoord.optional(),
+        angle: z.number().finite().optional(),
+        tid: z.number().int().min(0).optional(),
+        kind: z.enum(["normal", "friend", "foe"]).default("normal"),
+        force: z.boolean().optional(),
+        health: z.number().int().min(1).optional(),
+        special: z.number().int().min(0).max(255).optional(),
+        args: z.array(z.number().int()).max(5).optional(),
+        ambush: z.boolean().optional(),
+        dormant: z.boolean().optional(),
+      },
+    },
+    async ({ instance, className: cls, x, y, z: zPos, angle, tid, kind, force, health, special, args, ambush, dormant }) => {
+      if (args !== undefined && special === undefined) return fail("args needs special");
+      const padded = args && [...args, 0, 0, 0, 0, 0].slice(0, 5).join(",");
+      const kv = kvArgs({
+        z: zPos,
+        angle,
+        tid,
+        kind: kind === "normal" ? undefined : kind,
+        force: force ? 1 : undefined,
+        health,
+        special,
+        args: padded,
+        ambush: ambush ? 1 : undefined,
+        dormant: dormant ? 1 : undefined,
+      });
+      const client = await ctx.clientFor(instance);
+      const output = await client.runCommand(command("mcp_spawnat", cls, realToken(x), realToken(y), ...kv));
+      const line = parseKvLines(output, "spawned")[0];
+      if (!line) return failed(output);
+      const spawned = expandFlags(line);
+      const hint = spawned.tid
+        ? `; follow up with actor_state(tid ${spawned.tid}) / find_actors(class, tid)`
+        : "; no tid, so find it with find_actors(class) by position";
+      const text = `spawned ${spawned.class} tid=${spawned.tid} at ${spawned.x},${spawned.y},${spawned.z}${hint}`;
+      return { content: [{ type: "text", text }], structuredContent: { ...spawned } };
+    },
+  );
+
+  registerLive(
+    "set_cheat",
+    {
+      title: "Set a cheat on or off",
+      description:
+        "Idempotently turn a player cheat on or off. Reads the cheat bit from the engine-state snapshot and only runs the stock toggle CCMD (god, notarget, ...) when it differs, then waits for the bit to flip, so a blind toggle can never switch it the wrong way. Uses the engine's normal net path. Needs a bridge with the status cap and a cheats= field.",
+      inputSchema: {
+        instance: instanceArg,
+        name: z.enum(CHEAT_NAMES),
+        on: z.boolean(),
+      },
+    },
+    async ({ instance, name, on }) => {
+      const client = await ctx.clientFor(instance);
+      const bit = CHEATS[name];
+      const read = () => {
+        const cheats = client.lastStatus?.cheats;
+        return cheats === undefined ? undefined : (Number(cheats) & bit) !== 0;
+      };
+      await client.readStatus(STATUS_READ_MS);
+      const snapshot = statusField(client, "cheats", ", or there is no player");
+      if ("error" in snapshot) return fail(`can't read cheat state: ${snapshot.error}`);
+      const want = on ? "on" : "off";
+      if (read() === on) {
+        return { content: [{ type: "text", text: `${name} already ${want}; no change` }] };
+      }
+      const output = await client.runCommand(name);
+      const { value } = await pollUntil(read, (v) => v === on, {
+        waits: CHEAT_POLLS,
+        wait: async () => {
+          await sleep(CHEAT_POLL_MS);
+          await client.refreshStatus();
+        },
+      });
+      if (value !== on) return fail(`${name} did not turn ${want}; the engine said: ${outputText(output)}`);
+      return { content: [{ type: "text", text: `${name} ${want}` }] };
     },
   );
 
@@ -403,6 +645,75 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
   );
 
   registerLive(
+    "run_acs",
+    {
+      title: "Hot-load and run an ACS snippet",
+      description:
+        "Compile full ACS source host-side (bcc by default: zt-bcc or bcc on PATH, with zt-bcc's lib/ found next to or one folder above the binary; or acc on PATH; ZANDRONUM_BCC/ZANDRONUM_ACC override the executables) and load it into the running level as a temporary module, then optionally run one of its scripts by number or name with up to 4 args. The script runs inside this call until its first delay, so its Log() output comes back in the reply (Print() is a HUD message: use read_hud); stepTics then runs the sim that many tics and returns the log lines printed meanwhile. A snippet that isn't a #library is compiled as one, so its strings resolve. It may #import a library the level already loaded (pass includeDirs for its source) and then shares that library's live functions and map vars; importing a library that isn't loaded is refused before anything is sent. open runs its OPEN scripts. Compile errors come back without touching the engine. Offline only (no server/client). Zandronum can't unload a module: one the engine rejects stays loaded, inert, and every snippet stays until the map changes. While any is loaded save_game refuses: a save would fail to load (in-game saves and leaving a hub level carry the same hazard, which this tool can't intercept).",
+      inputSchema: {
+        instance: instanceArg,
+        source: z.string().min(1),
+        script: z.union([z.number().int(), z.string().regex(/^[^\s;"]+$/, "a script name has no spaces")]).optional(),
+        args: z.array(z.number().int()).max(4).optional(),
+        compiler: z.enum(["bcc", "acc"]).default("bcc"),
+        includeDirs: z
+          .array(z.string().min(1))
+          .optional()
+          .describe("Absolute paths; a relative one resolves against the MCP server's working directory."),
+        open: z.boolean().optional(),
+        stepTics: z.number().int().min(0).default(0),
+      },
+    },
+    async ({ instance, source, script, args, compiler, includeDirs, open, stepTics }, extra) => {
+      if (args !== undefined && script === undefined) return fail("args needs script");
+      const client = await ctx.clientFor(instance);
+      if (stepTics > 0 && !client.supports("time")) return fail(NO_TIME_CAP);
+      // A blank env var means unset, so PATH is searched.
+      const exe = ctx.config[compiler]?.trim() || undefined;
+      const built = ctx.io.compileAcs({ compiler, exe, source, includeDirs });
+      let output: string[];
+      try {
+        if (!built.ok) return fail(`compile failed (${built.exe === undefined ? compiler : `${compiler}: ${built.exe}`}), nothing sent to the engine:\n${built.diagnostics}`);
+        // The engine can't unload a module it rejects, so catch what we can first.
+        const obj = ctx.io.readFileSync(built.object);
+        if (!isAcsObject(obj)) return fail(`${compiler} produced no ACS object; nothing sent to the engine`);
+        const imports = parseLoadNames(obj);
+        if (imports.length > 0) {
+          const loaded = parseModules(await client.runCommand("dumpmodules")).map((m) => m.name);
+          const missing = missingImports(imports, loaded);
+          if (missing.length > 0) {
+            return fail(`imports ${missing.join(", ")}, not loaded in this level; nothing sent to the engine`);
+          }
+        }
+        const run = script === undefined ? [] : [script, ...(args ?? [])];
+        output = await client.runCommand(buildRunAcs(built.token, ...run, ...kvArgs({ open: open ? 1 : undefined })));
+      } finally {
+        ctx.io.removeDir(built.dir);
+      }
+      const result = parseRunAcs(output);
+      if (!result) return fail(outputText(output));
+
+      let later: string[] | undefined;
+      if (stepTics > 0) {
+        const readLog = (sinceLine?: number) => {
+          const log = ctx.readLog(instance);
+          return log === undefined ? undefined : readLogWindow(log, { sinceLine, maxLines: LOG_LINES });
+        };
+        const since = readLog()?.nextLine;
+        await withProgress(extra, (stepTics / TICRATE) * 1000, `advancing ${stepTics} tic(s)`, () =>
+          runTics(client, stepTics),
+        );
+        later = since === undefined ? undefined : readLog(since)?.lines.map((l) => l.text);
+      }
+
+      return {
+        content: [{ type: "text", text: runAcsText(result, stepTics, later) }],
+        structuredContent: { ...result.reply, output: result.printed, ...(later ? { log: later } : {}) },
+      };
+    },
+  );
+
+  registerLive(
     "screenshot",
     {
       title: "Screenshot",
@@ -415,6 +726,31 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
         ctx.io.capture(client, ctx.config.screenshotDir),
       );
       return { content: [{ type: "image", data: shot.base64, mimeType: "image/png" }] };
+    },
+  );
+
+  registerLive(
+    "screenshot_file",
+    {
+      title: "Screenshot to a file",
+      description:
+        "Take a screenshot and leave it on disk, returning only its absolute path (no image content). For measuring pixels with a script instead of viewing the frame. A reused `name` overwrites that file.",
+      inputSchema: {
+        instance: instanceArg,
+        // No spaces or `;`: the name goes unquoted into a console command line.
+        name: z
+          .string()
+          .regex(/^[\w-]+$/, "letters, digits, _ and - only (no extension)")
+          .optional(),
+      },
+    },
+    async ({ instance, name }, extra) => {
+      const client = await ctx.clientFor(instance);
+      const shot = await withProgress(extra, 19000, "capturing screenshot", () =>
+        ctx.io.capture(client, ctx.config.screenshotDir, { name, keep: true }),
+      );
+      const file = path.resolve(shot.path);
+      return { content: [{ type: "text", text: file }], structuredContent: { path: file } };
     },
   );
 
@@ -651,11 +987,128 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
       if (!client.supports("time")) {
         return { isError: true, content: [{ type: "text", text: NO_TIME_CAP }] };
       }
-      const durationMs = (tics / TICRATE) * 1000;
-      client.setPause(false);
-      await withProgress(extra, durationMs, `advancing ${tics} tic(s)`, () => sleep(durationMs));
-      client.setPause(true);
+      await withProgress(extra, (tics / TICRATE) * 1000, `advancing ${tics} tic(s)`, () =>
+        runTics(client, tics),
+      );
       return { content: [{ type: "text", text: `advanced ~${tics} tic(s)` }] };
+    },
+  );
+
+  registerLive(
+    "ensure_live",
+    {
+      title: "Check that the sim is advancing",
+      description:
+        "Prove the simulation actually advances: list what could block it (menu, console, chat, automap, not in a level, dead/spectating player, demo, a pending map/save/demo load, which it first waits out for up to ~5 s), then run it ~5 tics and check the map tic counter moved. The pause state is left as found, since `paused` is the normal driving state and `step` runs through it. With fix, first closes the menu (`closemenu`) and hides the console, chat and automap (`mcp_unblock`). Returns live plus the blockers found, fixed and remaining.",
+      inputSchema: { instance: instanceArg, fix: z.boolean().default(false) },
+    },
+    async ({ instance, fix }) => {
+      const client = await ctx.clientFor(instance);
+      if (!client.supports("time")) return fail(NO_TIME_CAP);
+      await client.readStatus(STATUS_READ_MS);
+      // A load finishing mid-probe resets maptime and reads as not live: let it run first.
+      const waited = client.lastStatus?.pending === "1" && (await awaitLoad(client)).settled;
+      const first = statusField(client, "maptime");
+      if ("error" in first) return fail(`can't check liveness: ${first.error}`);
+      const found = statusBlockers(first.status);
+      const wasPaused = first.status.paused !== "0";
+      if (fix) {
+        await client.runCommand("closemenu");
+        await client.runCommand("mcp_unblock");
+      }
+      // Fresh either way: the refresh above, or the last fix command's own sentinel.
+      const start = statusField(client, "maptime");
+      if ("error" in start) return fail(`can't check liveness: ${start.error}`);
+      const before = Number(start.status.maptime);
+      await runTics(client, LIVE_PROBE_TICS, wasPaused);
+      await client.readStatus(STATUS_READ_MS);
+      const end = statusField(client, "maptime");
+      if ("error" in end) return fail(`can't check liveness: ${end.error}`);
+      const after = Number(end.status.maptime);
+      const live = after > before;
+      const remaining = statusBlockers(end.status);
+      const fixed = fix ? found.filter((b) => !remaining.includes(b)) : undefined;
+      const parts = [
+        live ? `live (maptime ${before} -> ${after})` : `NOT live (maptime ${before} -> ${after})`,
+        ...(waited ? ["waited for a pending map/save/demo load first"] : []),
+        ...(fixed?.length ? [`fixed: ${fixed.join(", ")}`] : []),
+        ...(remaining.length ? [`blockers: ${remaining.join(", ")}`] : []),
+      ];
+      return {
+        content: [{ type: "text", text: parts.join("; ") }],
+        structuredContent: {
+          live,
+          maptime: { before, after },
+          found,
+          ...(fixed ? { fixed } : {}),
+          remaining,
+        },
+      };
+    },
+  );
+
+  registerLive(
+    "step_until",
+    {
+      title: "Step until a condition holds",
+      description:
+        "Advance the sim in chunks of chunkTics until a condition holds or maxTics run out, then leave it paused like `step`. The condition compares a map var, map array element, ACS world/global var or player field (x, y, z, angle, floorHeight, sector, light, health, armor) against a number, or a player field against another field (e.g. z == floorHeight). Reports the map tics that actually elapsed. Fails fast with the blocker list if a chunk doesn't advance the map tic counter.",
+      inputSchema: {
+        instance: instanceArg,
+        condition: conditionArg,
+        maxTics: z.number().int().positive(),
+        chunkTics: z.number().int().positive().default(5),
+      },
+    },
+    async ({ instance, condition, maxTics, chunkTics }, extra) => {
+      const client = await ctx.clientFor(instance);
+      if (!client.supports("time")) return fail(NO_TIME_CAP);
+      // Every read is a command, whose own sentinel refreshes maptime for free.
+      const maptime = () => Number(client.lastStatus?.maptime);
+      const first = await readCondition(client, condition);
+      const snapshot = statusField(client, "maptime");
+      if ("error" in snapshot) return fail(`can't count tics: ${snapshot.error}`);
+      const start = maptime();
+      let prev = start;
+      let stalled = false;
+      const read = async () => {
+        const got = await readCondition(client, condition);
+        const now = maptime();
+        if (!(now > prev)) stalled = true;
+        prev = now;
+        return got;
+      };
+      let stepped = 0;
+      const test = (r: typeof first) => "error" in r || stalled || COMPARE[condition.op](r.left, r.right);
+      const { value } = await withProgress(extra, (maxTics / TICRATE) * 1000, "stepping until condition", () =>
+        pollUntil(() => (stepped === 0 ? first : read()), test, {
+          waits: Math.ceil(maxTics / chunkTics),
+          wait: async () => {
+            const n = Math.min(chunkTics, maxTics - stepped);
+            await runTics(client, n);
+            stepped += n;
+          },
+        }),
+      );
+      if ("error" in value) return fail(value.error);
+      const elapsed = prev - start;
+      if (stalled) {
+        const blockers = statusBlockers(client.lastStatus);
+        const why = blockers.length ? blockers.join(", ") : "no blocker reported";
+        const at = Number.isNaN(prev) ? "unreadable" : `stuck at ${prev}`;
+        return fail(`the sim stopped advancing (maptime ${at}); ${why}. Try ensure_live with fix.`);
+      }
+      const met = COMPARE[condition.op](value.left, value.right);
+      const cmp = `${value.left} ${condition.op} ${value.right}`;
+      return {
+        content: [
+          {
+            type: "text",
+            text: met ? `met after ${elapsed} tic(s): ${cmp}` : `not met within ${elapsed} tic(s): ${cmp}`,
+          },
+        ],
+        structuredContent: { met, tics: elapsed, value: value.left },
+      };
     },
   );
 
@@ -669,14 +1122,11 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
     async ({ instance, scope, index }) => {
       const client = await ctx.clientFor(instance);
-      const output = await client.runCommand(command("getacsvar", scope, index));
-      const vars = parseAcsVars(output);
-      if (vars.length === 0) {
-        return { isError: true, content: [{ type: "text", text: output.join("\n") || "no value" }] };
-      }
+      const read = await readAcsVar(client, scope, index);
+      if ("error" in read) return fail(read.error);
       return {
-        content: [{ type: "text", text: String(vars[0].value) }],
-        structuredContent: { scope, index, value: vars[0].value },
+        content: [{ type: "text", text: String(read.value) }],
+        structuredContent: { scope, index, value: read.value },
       };
     },
   );
@@ -795,6 +1245,32 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
   );
 
+  server.registerTool(
+    "list_map_exports",
+    {
+      title: "List exported map variables from compiled bytecode",
+      description:
+        "List each ACS module's exported map variables and arrays (MEXP/ARAY chunks) from a WAD, PK3 or compiled .o, with slot index and array size. get_map_var/get_map_array only see exported names, so check here before a launch or pk3 rebuild. `lump` narrows to modules whose name or basename matches (e.g. `mymod` for `acs/mymod.o`).",
+      inputSchema: { file: z.string().min(1), lump: z.string().min(1).optional() },
+    },
+    async ({ file, lump }) => {
+      const all = collectAcsModules(ctx.io.readFileSync(file), path.basename(file));
+      const picked = pickModules(all, lump);
+      if (picked.length === 0) {
+        const known = all.map((m) => m.name).join(", ") || "none";
+        return fail(`No ACS module matches "${lump}" in ${file}. Modules: ${known}`);
+      }
+      const modules = picked.map((m) => ({ module: m.name, exports: parseMapExports(m.data) }));
+      const text = modules
+        .map(({ module, exports }) => {
+          const rows = exports.map((e) => `  ${e.index}: ${e.name}${e.isArray ? `[${e.size}]` : ""}`);
+          return [`${module}: ${exports.length} export(s)`, ...rows].join("\n");
+        })
+        .join("\n");
+      return { content: [{ type: "text", text }], structuredContent: { modules } };
+    },
+  );
+
   // --- savegames & demos -----------------------------------------------------
   server.registerTool(
     "list_saves",
@@ -831,6 +1307,20 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
     async ({ instance, name, description }) => {
       const client = await ctx.clientFor(instance);
+      // A run_acs module makes the save unloadable (module-count I_Error), so this exact read
+      // (no bare MCP_STATUS line reaches the log) fails closed on a timeout.
+      const { status } = await client.readStatus(STATUS_READ_MS);
+      if (client.supports("status") && status === undefined) {
+        return fail(
+          "refused: status read timed out (engine busy, e.g. loading a map), so loaded run_acs snippets can't be ruled out; retry",
+        );
+      }
+      const temp = status?.acstemp;
+      if (temp !== undefined && temp !== "0") {
+        return fail(
+          `refused: ${temp} run_acs snippet module(s) are loaded, and loading a save taken now fails (ACS module count mismatch). Change or reload the map (load_map) first.`,
+        );
+      }
       const out = (await client.runCommand(buildSave(name, description))).join("\n");
       // `save` only queues the write (G_SaveGame sets sendsave), so "Game saved." prints a
       // tic after this reply; every rejection prints in-call.
@@ -881,13 +1371,10 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
     async ({ instance }) => {
       const client = await ctx.clientFor(instance);
-      const parsed = parsePlayerState(await client.runCommand("currentpos"));
-      if (!parsed) {
+      const state = await readPlayerState(client);
+      if (!state) {
         return { isError: true, content: [{ type: "text", text: "no player (not in a level?)" }] };
       }
-      // Already fresh with zero extra round trips: the `currentpos` command
-      // above just refreshed `lastStatus` via its own sentinel line.
-      const state = withLiveStatus(parsed, client.lastStatus);
       return {
         content: [{ type: "text", text: JSON.stringify(state) }],
         structuredContent: { ...state },
@@ -900,12 +1387,25 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     {
       title: "Actor state (DECORATE)",
       description:
-        "Run `dumpactor` and return an actor's live state: class, health, position, current DECORATE state (sprite/frame/tics, e.g. TNT1 A 0), inventory, and (for players) ready weapon + morph status. Defaults to the player; pass a TID for any actor.",
-      inputSchema: { instance: instanceArg, tid: z.number().int().min(0).optional() },
+        "Run `dumpactor` and return an actor's live state: class, health, position, angle, pitch, current DECORATE state (sprite/frame/tics, e.g. TNT1 A 0), inventory, and (for players) ready weapon + morph status. Defaults to the player; pass a TID for any actor, plus index for the nth actor sharing it.",
+      inputSchema: {
+        instance: instanceArg,
+        tid: z.number().int().min(0).optional(),
+        index: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe("Pick the nth (0-based) actor sharing the TID; needs tid."),
+      },
     },
-    async ({ instance, tid }) => {
+    async ({ instance, tid, index }) => {
+      if (index !== undefined && tid === undefined) return fail("index needs a tid");
       const client = await ctx.clientFor(instance);
-      const cmd = tid !== undefined ? command("dumpactor", tid) : "dumpactor";
+      const cmd =
+        tid === undefined
+          ? "dumpactor"
+          : command("dumpactor", tid, ...(index !== undefined ? [index] : []));
       const state = parseActorState(await client.runCommand(cmd));
       if (state.class === null) {
         return {
@@ -979,6 +1479,89 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
       return {
         content: [{ type: "text", text: JSON.stringify(target) }],
         structuredContent: { ...target },
+      };
+    },
+  );
+
+  registerLive(
+    "set_view",
+    {
+      title: "Set the player's view",
+      description:
+        "Point the player's view: an absolute angle (degrees, Doom convention: 0 east, 90 north) with optional pitch (degrees, negative looks up), or face an actor by tid (first actor with it) or class (nearest map actor of that class, aiming at its mid-height). Give exactly one of angle, tid, class.",
+      inputSchema: {
+        instance: instanceArg,
+        angle: z.number().finite().optional(),
+        pitch: z.number().finite().optional(),
+        tid: z.number().int().min(1).optional(),
+        class: classArg.optional(),
+      },
+    },
+    async ({ instance, angle, pitch, tid, class: cls }) => {
+      const modes = [angle, tid, cls].filter((m) => m !== undefined).length;
+      if (modes !== 1 || (pitch !== undefined && angle === undefined)) {
+        return fail("give exactly one of angle, tid or class (pitch only with angle)");
+      }
+      const cmd =
+        angle !== undefined
+          ? command("mcp_setview", realToken(angle), ...(pitch !== undefined ? [realToken(pitch)] : []))
+          : command("mcp_setview", ...kvArgs({ tid, class: cls }));
+      const client = await ctx.clientFor(instance);
+      const output = await client.runCommand(cmd);
+      const view = parseKvLines(output, "view")[0];
+      if (!view) return failed(output);
+      return {
+        content: [{ type: "text", text: JSON.stringify(view) }],
+        structuredContent: { ...view },
+      };
+    },
+  );
+
+  registerLive(
+    "list_players",
+    {
+      title: "List players",
+      description:
+        "Run `dumpplayers` and return every in-game player: slot, bot, spectator/dead-spectator, player state, health, armor, ready weapon, x/y/z, angle, pitch, TID, cheat bits, frags, deaths, kills/items/secrets, points, wins, team, ping and name. Bots join at slot 1+.",
+      inputSchema: { instance: instanceArg },
+    },
+    async ({ instance }) => {
+      const client = await ctx.clientFor(instance);
+      const output = await client.runCommand("dumpplayers");
+      if (!hasHeader(output, "MCP_PLAYERS")) return failed(output);
+      const players = parseKvLines(output, "player");
+      return {
+        content: [{ type: "text", text: `${players.length} player(s)` }],
+        structuredContent: { players },
+      };
+    },
+  );
+
+  registerLive(
+    "find_actors",
+    {
+      title: "Find actors map-wide",
+      description:
+        "Run `findactors` and list map actors (owned inventory excluded), optionally filtered by class (includes subclasses), TID and radius around the player, sorted by distance. Each has class, tid, hp/spawnhp, x/y/z, angle, pitch, dist, sprite/frame, flags (monster, friendly, corpse, dormant, shootable, solid, invulnerable, ambush) and target. detail adds master/tracer, special + args, vel, radius/height, floorz and player index. With a tid filter each result also has index, the one to pass to actor_state(tid, index) for it (the list is in distance order, not index order).",
+      inputSchema: {
+        instance: instanceArg,
+        class: classArg.optional(),
+        tid: z.number().int().min(1).optional(),
+        radius: z.number().int().positive().optional(),
+        limit: z.number().int().positive().optional(),
+        detail: z.boolean().optional(),
+      },
+    },
+    async ({ instance, class: cls, tid, radius, limit, detail }) => {
+      const args = kvArgs({ class: cls, tid, radius, limit, detail: detail ? 1 : undefined });
+      const client = await ctx.clientFor(instance);
+      const output = await client.runCommand(command("findactors", ...args));
+      if (firstError(output) !== undefined || !hasHeader(output, "MCP_FOUND")) return failed(output);
+      const found = parseFindActors(output);
+      const cut = found.truncated ? ` (showing ${found.truncated.shown} of ${found.truncated.total})` : "";
+      return {
+        content: [{ type: "text", text: `${found.actors.length} actor(s) found${cut}` }],
+        structuredContent: { ...found },
       };
     },
   );
@@ -1092,11 +1675,9 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
     async ({ instance, name }) => {
       const client = await ctx.clientFor(instance);
-      const value = parseMapVar(await client.runCommand(command("getmapvar", name)));
-      if (value === null) {
-        return { isError: true, content: [{ type: "text", text: `map var '${name}' not found` }] };
-      }
-      return { content: [{ type: "text", text: String(value) }], structuredContent: { name, value } };
+      const read = await readMapVar(client, name);
+      if ("error" in read) return fail(read.error);
+      return { content: [{ type: "text", text: String(read.value) }], structuredContent: { name, value: read.value } };
     },
   );
 
@@ -1129,13 +1710,11 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
     },
     async ({ instance, name, index }) => {
       const client = await ctx.clientFor(instance);
-      const value = parseMapArray(await client.runCommand(command("getmaparray", name, index)));
-      if (value === null) {
-        return { isError: true, content: [{ type: "text", text: `map array '${name}' not found` }] };
-      }
+      const read = await readMapArray(client, name, index);
+      if ("error" in read) return fail(read.error);
       return {
-        content: [{ type: "text", text: String(value) }],
-        structuredContent: { name, index, value },
+        content: [{ type: "text", text: String(read.value) }],
+        structuredContent: { name, index, value: read.value },
       };
     },
   );
@@ -1539,24 +2118,44 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
       inputSchema: { instance: instanceArg },
     },
     async ({ instance }) => {
-      const logFile = ctx.logPathFor(instance);
-      if (!logFile || !ctx.io.existsSync(logFile)) {
-        return {
-          isError: true,
-          content: [
-            {
-              type: "text",
-              text: `No engine log for instance ${instance}. Launch it via launch_instance (which enables logging), then re-run this if it failed to start.`,
-            },
-          ],
-        };
+      const log = ctx.readLog(instance);
+      if (log === undefined) {
+        return fail(
+          `No engine log for instance ${instance}. Launch it via launch_instance (which enables logging), then re-run this if it failed to start.`,
+        );
       }
-      const log = ctx.io.readTextSync(logFile);
       const errors = parseStartupErrors(log);
       const body = errors.length
         ? `Detected ${errors.length} error line(s) in the engine log:\n\n${errors.join("\n")}`
         : `No compile/fatal errors detected. Last lines of the engine log for context:\n\n${tailLines(log).join("\n")}`;
       return { content: [{ type: "text", text: body }] };
+    },
+  );
+
+  server.registerTool(
+    "read_log",
+    {
+      title: "Read the engine console log",
+      description:
+        "Read an instance's engine console log, which catches prints that never come back in a command reply (e.g. cheat ON/OFF messages, emitted a tic later). Correlation sentinel lines are dropped. `pattern` is a case-insensitive regex filter. Without `sinceLine` this returns the last `maxLines` matches; with it, the first `maxLines` matches after that line. Pass the returned `nextLine` as `sinceLine` to read only what was logged since.",
+      inputSchema: {
+        instance: instanceArg,
+        pattern: z.string().min(1).optional(),
+        sinceLine: z.number().int().nonnegative().optional(),
+        maxLines: z.number().int().positive().default(LOG_LINES),
+      },
+    },
+    async ({ instance, pattern, sinceLine, maxLines }) => {
+      const log = ctx.readLog(instance);
+      if (log === undefined) {
+        return fail(`No engine log for instance ${instance}. Launch it via launch_instance, which enables logging.`);
+      }
+      const win = readLogWindow(log, { pattern, sinceLine, maxLines });
+      const head =
+        `${win.lines.length} line(s), nextLine=${win.nextLine}` +
+        (win.omitted ? `, ${win.omitted} more matching line(s) not shown` : "");
+      const text = [head, ...win.lines.map((l) => `${l.line}: ${l.text}`)].join("\n");
+      return { content: [{ type: "text", text }], structuredContent: { ...win } };
     },
   );
 

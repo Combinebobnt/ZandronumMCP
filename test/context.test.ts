@@ -64,6 +64,16 @@ describe("ServerContext ports and log paths", () => {
   it("has no log path at all without an engine configured", () => {
     expect(makeCtx().logPathFor(1)).toBeUndefined();
   });
+
+  it("reads an instance's log, or nothing when it has no path or no file", () => {
+    expect(makeCtx().readLog(1)).toBeUndefined();
+    const io = { existsSync: (p: string) => p === "/a.log", readTextSync: () => "line\n" };
+    const ctx = makeCtx({}, io);
+    ctx.rememberLaunch(1, 7801, "/a.log");
+    ctx.rememberLaunch(2, 7802, "/gone.log");
+    expect(ctx.readLog(1)).toBe("line\n");
+    expect(ctx.readLog(2)).toBeUndefined();
+  });
 });
 
 describe("ServerContext.clientFor", () => {
@@ -278,6 +288,10 @@ describe("defaultContextIo", () => {
     });
     expect(ticks).toBe(2);
     expect(defaultContextIo.hasBridge(here)).toBe(false);
+    const built = defaultContextIo.compileAcs({ compiler: "bcc", exe: "/no/such/bcc", source: "x" });
+    expect(built).toMatchObject({ ok: false, diagnostics: "compiler /no/such/bcc (set by ZANDRONUM_BCC) not found." });
+    defaultContextIo.removeDir(built.dir);
+    expect(defaultContextIo.existsSync(built.dir)).toBe(false);
     expect(typeof defaultContextIo.launchIo.spawn).toBe("function");
   });
 

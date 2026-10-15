@@ -4,8 +4,9 @@ import { startHarness, collectTools, type Harness } from "./fakes/tool-harness.j
 import { FakeBridge } from "./fakes/fake-bridge.js";
 import { InstanceRegistry } from "./../src/process/registry.js";
 import type { ContextIo, ServerConfig } from "../src/context.js";
-import { buildWad, sectorsLump, doomLinedefsLump, sidedefsLump, vertexesLump } from "./fakes/wad-builder.js";
-import { buildBehaviorAcse } from "./fakes/acs-builder.js";
+import { buildWad, buildZip, sectorsLump, doomLinedefsLump, sidedefsLump, vertexesLump } from "./fakes/wad-builder.js";
+import { buildBehaviorAcse, buildBehaviorExports } from "./fakes/acs-builder.js";
+import { readFileSync } from "node:fs";
 
 /**
  * Drives every registered tool through a real MCP client/server pair — the
@@ -53,6 +54,12 @@ async function live(opts: LiveOptions = {}): Promise<Harness> {
   await harness.call("attach_instance");
   return harness;
 }
+
+/** `live()` on a status-capable bridge, with the fake's default all-normal snapshot. */
+const withStatus = (opts: LiveOptions = {}) => live({ ...opts, caps: ["cmd", "event", "time", "status"] });
+
+/** The text of every console command the fake bridge has received. */
+const cmds = () => bridge!.received.filter((m) => m.t === "cmd").map((m) => m.text ?? "");
 
 /** Wait for a fire-and-forget send to reach the fake bridge. */
 async function settle(done: () => boolean, tries = 100): Promise<void> {
@@ -164,6 +171,33 @@ describe("console, cheat and script tools", () => {
     const h = await live();
     const result = await h.call("screenshot");
     expect(result.content?.[0]).toMatchObject({ type: "image", mimeType: "image/png", data: "UE5H" });
+  });
+
+  it("saves a kept screenshot and returns only its absolute path", async () => {
+    const seen: Array<{ name?: string; keep?: boolean } | undefined> = [];
+    const h = await live({
+      config: { screenshotDir: "/shots" },
+      io: {
+        capture: (_c, dir, opts) => {
+          seen.push(opts);
+          return Promise.resolve({ base64: "UE5H", path: `${dir}/${opts?.name ?? "auto"}.png` });
+        },
+      },
+    });
+    const named = await h.call("screenshot_file", { name: "wall_1" });
+    expect(named.content?.[0]).toEqual({ type: "text", text: "/shots/wall_1.png" });
+    expect(named.structuredContent).toEqual({ path: "/shots/wall_1.png" });
+    expect(await h.text("screenshot_file")).toBe("/shots/auto.png");
+    expect(seen).toEqual([
+      { name: "wall_1", keep: true },
+      { name: undefined, keep: true },
+    ]);
+  });
+
+  it("rejects a screenshot name that would break the console command line", async () => {
+    const h = await live();
+    expect((await h.call("screenshot_file", { name: "a b" })).isError).toBe(true);
+    expect((await h.call("screenshot_file", { name: "x;quit" })).isError).toBe(true);
   });
 });
 
@@ -438,6 +472,55 @@ describe("ACS source and bytecode tools", () => {
       namedScripts: ["OpenDoor"],
     });
   });
+
+  describe("list_map_exports", () => {
+    const pk3 = buildZip([
+      { name: "acs/mymod.o", data: buildBehaviorExports(["credits", "round"], [{ index: 0, size: 17 }]) },
+      { name: "acs/other.o", data: buildBehaviorExports(["x"]) },
+    ]);
+
+    it("lists every module's exports, arrays sized", async () => {
+      const h = await offline({}, { readFileSync: () => pk3 });
+      const result = await h.call("list_map_exports", { file: "/mods/x.pk3" });
+      expect(result.content?.[0]?.text).toBe(
+        "acs/mymod.o: 2 export(s)\n  0: credits[17]\n  1: round\nacs/other.o: 1 export(s)\n  0: x",
+      );
+      expect(result.structuredContent?.modules).toHaveLength(2);
+    });
+
+    it("narrows to one module by basename or full name", async () => {
+      const h = await offline({}, { readFileSync: () => pk3 });
+      const byBase = await h.call("list_map_exports", { file: "/mods/x.pk3", lump: "MyMod" });
+      expect(byBase.structuredContent?.modules).toEqual([
+        {
+          module: "acs/mymod.o",
+          exports: [
+            { name: "credits", index: 0, isArray: true, size: 17 },
+            { name: "round", index: 1, isArray: false },
+          ],
+        },
+      ]);
+      const byFull = await h.call("list_map_exports", { file: "/mods/x.pk3", lump: "acs/other.o" });
+      expect(byFull.content?.[0]?.text).toBe("acs/other.o: 1 export(s)\n  0: x");
+    });
+
+    it("names a raw compiled file after itself", async () => {
+      const h = await offline({}, { readFileSync: () => buildBehaviorExports(["v"]) });
+      expect(await h.text("list_map_exports", { file: "/build/lib.o" })).toBe("lib.o: 1 export(s)\n  0: v");
+    });
+
+    it("errors with the available module names when lump matches nothing", async () => {
+      const h = await offline({}, { readFileSync: () => pk3 });
+      const result = await h.call("list_map_exports", { file: "/mods/x.pk3", lump: "nope" });
+      expect(result.isError).toBe(true);
+      expect(result.content?.[0]?.text).toMatch(/Modules: acs\/mymod\.o, acs\/other\.o$/);
+    });
+
+    it("says so when the file has no ACS modules at all", async () => {
+      const h = await offline({}, { readFileSync: () => buildZip([{ name: "decorate.txt", data: Buffer.from("x") }]) });
+      expect(await h.text("list_map_exports", { file: "/e.pk3", lump: "a" })).toMatch(/Modules: none$/);
+    });
+  });
 });
 
 describe("savegame and demo tools", () => {
@@ -600,6 +683,503 @@ describe("live state tools", () => {
   it("reports no target in view", async () => {
     const h = await live();
     expect(await h.text("inspect_target")).toBe("no target in view");
+  });
+});
+
+describe("test-session tools", () => {
+  it("drills into the nth actor sharing a TID, and needs a tid for index", async () => {
+    const h = await live({ responses: { dumpactor: ["MCP_ACTOR", "class DoomImp", "pitch 5.0"] } });
+    const res = await h.call("actor_state", { tid: 7, index: 2 });
+    expect(res.structuredContent).toMatchObject({ class: "DoomImp", pitch: 5 });
+    expect(cmds().at(-1)).toMatch(/^dumpactor 7 2 /);
+    const bad = await h.call("actor_state", { index: 1 });
+    expect(bad.isError).toBe(true);
+    expect(bad.content?.[0]?.text).toBe("index needs a tid");
+  });
+
+  describe("set_cheat", () => {
+    it("is a no-op when the bit already matches", async () => {
+      const h = await withStatus();
+      bridge!.setStatus({ cheats: String(1 << 1) });
+      bridge!.clearReceived();
+      expect(await h.text("set_cheat", { name: "god", on: true })).toBe("god already on; no change");
+      expect(cmds().some((c) => c.startsWith("god"))).toBe(false);
+      expect(await h.text("set_cheat", { name: "notarget", on: false })).toBe(
+        "notarget already off; no change",
+      );
+    });
+
+    it("toggles once and waits for the bit to flip", async () => {
+      const h = await withStatus();
+      bridge!.onCommand("god", () => bridge!.setStatus({ cheats: "2" }));
+      expect(await h.text("set_cheat", { name: "god", on: true })).toBe("god on");
+      expect(cmds().filter((c) => /^god\b/.test(c))).toHaveLength(1);
+    });
+
+    it("polls until a late flip lands", async () => {
+      const h = await withStatus();
+      let toggled = false;
+      let probesAfter = 0;
+      bridge!.onCommand("noclip2", () => (toggled = true));
+      // An empty match sees every command, bare status probes included.
+      bridge!.onCommand("", () => {
+        if (toggled && ++probesAfter === 4) bridge!.setStatus({ cheats: String(1 << 30) });
+      });
+      expect(await h.text("set_cheat", { name: "noclip2", on: true })).toBe("noclip2 on");
+      expect(probesAfter).toBe(4);
+    });
+
+    it("reports a toggle that never lands, with the engine's own output", async () => {
+      const h = await withStatus({ responses: { buddha: ["sv_cheats must be true"] } });
+      const res = await h.call("set_cheat", { name: "buddha", on: true });
+      expect(res.isError).toBe(true);
+      expect(res.content?.[0]?.text).toBe("buddha did not turn on; the engine said: sv_cheats must be true");
+      const silent = await h.call("set_cheat", { name: "fly", on: true });
+      expect(silent.content?.[0]?.text).toBe("fly did not turn on; the engine said: (no output)");
+    });
+
+    it("fails a toggle whose status snapshot drops the cheats field", async () => {
+      const h = await withStatus();
+      bridge!.onCommand("notarget", () => bridge!.setStatus({ cheats: undefined }));
+      const res = await h.call("set_cheat", { name: "notarget", on: false });
+      expect(res.content?.[0]?.text).toBe("notarget already off; no change");
+      const gone = await h.call("set_cheat", { name: "notarget", on: true });
+      expect(gone.content?.[0]?.text).toBe("notarget did not turn on; the engine said: (no output)");
+    });
+
+    it("refuses when the snapshot has no cheats field", async () => {
+      const h = await withStatus();
+      bridge!.setStatus({ cheats: undefined });
+      const res = await h.call("set_cheat", { name: "god", on: true });
+      expect(res.isError).toBe(true);
+      expect(res.content?.[0]?.text).toMatch(/no cheats= field/);
+    });
+
+    it("refuses on a bridge without the status cap", async () => {
+      const h = await live();
+      const res = await h.call("set_cheat", { name: "god", on: true });
+      expect(res.isError).toBe(true);
+      expect(res.content?.[0]?.text).toMatch(/no status support/);
+    });
+  });
+
+  describe("set_view", () => {
+    it("sets an absolute angle, with and without pitch", async () => {
+      const h = await live({ responses: { mcp_setview: ["view angle=90.0 pitch=-10.0"] } });
+      const res = await h.call("set_view", { angle: 90, pitch: -10.5 });
+      expect(res.structuredContent).toEqual({ angle: 90, pitch: -10 });
+      await h.call("set_view", { angle: 45 });
+      expect(cmds()[0]).toMatch(/^mcp_setview 90 -10\.5 /);
+      expect(cmds()[1]).toMatch(/^mcp_setview 45 /);
+    });
+
+    it("faces an actor by tid or class", async () => {
+      const h = await live({
+        responses: { mcp_setview: ["view angle=12.0 pitch=3.0 tid=0 class=DoomImp"] },
+      });
+      expect(await h.text("set_view", { tid: 5 })).toMatch(/"class":"DoomImp"/);
+      await h.call("set_view", { class: "DoomImp" });
+      expect(cmds()[0]).toMatch(/^mcp_setview tid=5 /);
+      expect(cmds()[1]).toMatch(/^mcp_setview class=DoomImp /);
+    });
+
+    it("rejects zero or several modes, and pitch without angle", async () => {
+      const h = await live();
+      for (const args of [{}, { angle: 1, tid: 2 }, { tid: 1, pitch: 5 }]) {
+        const res = await h.call("set_view", args);
+        expect(res.isError).toBe(true);
+        expect(res.content?.[0]?.text).toMatch(/exactly one of angle, tid or class/);
+      }
+      expect(cmds()).toHaveLength(0);
+    });
+
+    it("surfaces an engine error line, or raw output when there's no view line", async () => {
+      const h = await live({
+        responses: { "tid=9": ["error no actor with tid 9"], "class=Foo": ["Unknown command"] },
+      });
+      expect(await h.text("set_view", { tid: 9 })).toBe("no actor with tid 9");
+      expect(await h.text("set_view", { class: "Foo" })).toBe("Unknown command");
+      expect(await h.text("set_view", { angle: 3 })).toBe("(no output)");
+    });
+  });
+
+  describe("summon_at", () => {
+    const SPAWNED =
+      "spawned class=DoomImp tid=7 hp=60 spawnhp=60 x=100.0 y=-32.5 z=0.0 angle=90.0 pitch=0.0 flags=mso";
+
+    it("sends only the given options and reports the spawned actor", async () => {
+      const h = await live({ responses: { mcp_spawnat: [SPAWNED] } });
+      const res = await h.call("summon_at", { className: "DoomImp", x: 100, y: -32.5 });
+      expect(res.isError).toBeFalsy();
+      expect(res.structuredContent).toMatchObject({ class: "DoomImp", tid: 7, x: 100, y: -32.5, flags: "monster,shootable,solid" });
+      expect(res.content?.[0]?.text).toBe(
+        "spawned DoomImp tid=7 at 100,-32.5,0; follow up with actor_state(tid 7) / find_actors(class, tid)",
+      );
+      await h.call("summon_at", {
+        className: "DoomImp", x: 1.5, y: 2, z: 64, angle: 45.5, tid: 3, kind: "friend", force: true,
+        health: 5, special: 80, args: [1, 2], ambush: true, dormant: true,
+      });
+      await h.call("summon_at", { className: "DoomImp", x: 0, y: 0, kind: "normal", force: false, ambush: false, dormant: false });
+      await h.call("summon_at", { className: "DoomImp", x: 0, y: 0, kind: "foe" });
+      expect(cmds()[0]).toMatch(/^mcp_spawnat DoomImp 100 -32\.5 ;/);
+      expect(cmds()[1]).toMatch(
+        /^mcp_spawnat DoomImp 1\.5 2 z=64 angle=45\.5 tid=3 kind=friend force=1 health=5 special=80 args=1,2,0,0,0 ambush=1 dormant=1 ;/,
+      );
+      expect(cmds()[2]).toMatch(/^mcp_spawnat DoomImp 0 0 ;/);
+      expect(cmds()[3]).toMatch(/^mcp_spawnat DoomImp 0 0 kind=foe ;/);
+    });
+
+    it("passes tid 0 through and drops the tid follow-up hint", async () => {
+      const h = await live({ responses: { mcp_spawnat: [SPAWNED.replace("tid=7", "tid=0").replace("flags=mso", "flags=-")] } });
+      const res = await h.call("summon_at", { className: "DoomImp", x: 1, y: 2, tid: 0 });
+      expect(cmds()[0]).toMatch(/^mcp_spawnat DoomImp 1 2 tid=0 ;/);
+      expect(res.structuredContent?.flags).toBe("");
+      expect(res.content?.[0]?.text).toMatch(/no tid, so find it with find_actors\(class\) by position$/);
+    });
+
+    it("reports the replacement class and requested name", async () => {
+      const h = await live({ responses: { mcp_spawnat: [SPAWNED.replace("DoomImp", "MyImp") + " requested=DoomImp"] } });
+      const res = await h.call("summon_at", { className: "DoomImp", x: 1, y: 2 });
+      expect(res.structuredContent).toMatchObject({ class: "MyImp", requested: "DoomImp" });
+    });
+
+    it("rejects args without special before sending anything", async () => {
+      const h = await live();
+      const res = await h.call("summon_at", { className: "DoomImp", x: 1, y: 2, args: [1] });
+      expect(res.isError).toBe(true);
+      expect(res.content?.[0]?.text).toBe("args needs special");
+      expect(cmds()).toHaveLength(0);
+    });
+
+    it("refuses coordinates outside the engine's fixed-point range before sending anything", async () => {
+      const h = await live();
+      for (const at of [{ x: 40000, y: 0 }, { x: 0, y: -32769 }, { x: 0, y: 0, z: 32768 }]) {
+        expect((await h.call("summon_at", { className: "DoomImp", ...at })).isError).toBe(true);
+      }
+      expect((await h.call("summon_at", { className: "DoomImp", x: -32768, y: 32767 })).content?.[0]?.text).toBe(
+        "(no output)",
+      );
+      expect(cmds()).toHaveLength(1);
+    });
+
+    it("surfaces each engine error shape, or raw output without a spawned line", async () => {
+      const h = await live({
+        responses: {
+          Nope: ["error unknown class Nope"],
+          "DoomImp 1 ": ["error blocked by player0"],
+          "DoomImp 2 ": ["error client: spawn on the server instance"],
+          "DoomImp 3 ": ["Unknown command"],
+        },
+      });
+      expect(await h.text("summon_at", { className: "Nope", x: 0, y: 0 })).toBe("unknown class Nope");
+      expect(await h.text("summon_at", { className: "DoomImp", x: 1, y: 0 })).toBe("blocked by player0");
+      expect(await h.text("summon_at", { className: "DoomImp", x: 2, y: 0 })).toBe("client: spawn on the server instance");
+      expect(await h.text("summon_at", { className: "DoomImp", x: 3, y: 0 })).toBe("Unknown command");
+      const res = await h.call("summon_at", { className: "DoomImp", x: 4, y: 0 });
+      expect(res.isError).toBe(true);
+      expect(res.content?.[0]?.text).toBe("(no output)");
+    });
+  });
+
+  it("lists players", async () => {
+    const h = await live({
+      responses: { dumpplayers: ["MCP_PLAYERS", "player slot=0 bot=0 name=Player", "player slot=1 bot=1 name=Bot"] },
+    });
+    const res = await h.call("list_players");
+    expect(res.content?.[0]?.text).toBe("2 player(s)");
+    expect(res.structuredContent?.players).toEqual([
+      { slot: 0, bot: 0, name: "Player" },
+      { slot: 1, bot: 1, name: "Bot" },
+    ]);
+  });
+
+  it("fails list_players when dumpplayers never ran (no MCP_PLAYERS header)", async () => {
+    const h = await live({ responses: { dumpplayers: ['Unknown command "dumpplayers"'] } });
+    const res = await h.call("list_players");
+    expect(res.isError).toBe(true);
+    expect(res.content?.[0]?.text).toBe('Unknown command "dumpplayers"');
+  });
+
+  describe("find_actors", () => {
+    it("passes only the given filters and reports the count", async () => {
+      const h = await live({ responses: { findactors: ["MCP_FOUND", "found class=DoomImp tid=0 flags=m"] } });
+      expect(await h.text("find_actors")).toBe("1 actor(s) found");
+      await h.call("find_actors", { class: "DoomImp", tid: 3, radius: 100, limit: 5, detail: true });
+      await h.call("find_actors", { detail: false });
+      expect(cmds()[0]).toMatch(/^findactors ;/);
+      expect(cmds()[1]).toMatch(/^findactors class=DoomImp tid=3 radius=100 limit=5 detail=1 /);
+      expect(cmds()[2]).toMatch(/^findactors ;/);
+    });
+
+    it("reports truncation", async () => {
+      const h = await live({
+        responses: { findactors: ["MCP_FOUND", "found class=A tid=0", "truncated shown=1 total=4"] },
+      });
+      const res = await h.call("find_actors", { limit: 1 });
+      expect(res.content?.[0]?.text).toBe("1 actor(s) found (showing 1 of 4)");
+      expect(res.structuredContent?.truncated).toEqual({ shown: 1, total: 4 });
+    });
+
+    it("surfaces an engine error", async () => {
+      const h = await live({ responses: { findactors: ["MCP_FOUND", "error unknown class Nope"] } });
+      const res = await h.call("find_actors", { class: "Nope" });
+      expect(res.isError).toBe(true);
+      expect(res.content?.[0]?.text).toBe("unknown class Nope");
+    });
+
+    it("fails when findactors never ran (no MCP_FOUND header)", async () => {
+      const h = await live({ responses: { findactors: ['Unknown command "findactors"'] } });
+      const res = await h.call("find_actors");
+      expect(res.isError).toBe(true);
+      expect(res.content?.[0]?.text).toBe('Unknown command "findactors"');
+    });
+
+    it("carries each TID match's actor_state index", async () => {
+      const h = await live({
+        responses: { findactors: ["MCP_FOUND", "found class=A tid=7 dist=10.0 index=2", "found class=A tid=7 dist=50.0 index=0"] },
+      });
+      const res = await h.call("find_actors", { tid: 7 });
+      expect((res.structuredContent?.actors as Array<{ index: number }>).map((a) => a.index)).toEqual([2, 0]);
+    });
+
+    it("rejects a class name with spaces", async () => {
+      const h = await live();
+      const res = await h.call("find_actors", { class: "Doom Imp" });
+      expect(res.isError).toBe(true);
+    });
+  });
+
+  /** Advance the fake's maptime by one on every command, status probes included. */
+  const ticking = () => {
+    let t = 0;
+    bridge!.onCommand("", () => bridge!.setStatus({ maptime: String(++t) }));
+  };
+
+  describe("ensure_live", () => {
+    it("reports live, leaves the pause state as found, and fixes nothing without fix", async () => {
+      const h = await withStatus();
+      bridge!.setStatus({ paused: "1" });
+      ticking();
+      bridge!.clearReceived();
+      const res = await h.call("ensure_live");
+      expect(res.content?.[0]?.text).toBe("live (maptime 1 -> 2)");
+      expect(res.structuredContent).toEqual({ live: true, maptime: { before: 1, after: 2 }, found: [], remaining: [] });
+      expect(bridge!.pauses.slice(-2)).toEqual([0, 1]);
+      expect(cmds().some((c) => /closemenu|mcp_unblock/.test(c))).toBe(false);
+    });
+
+    it("reports a stuck sim with its blockers", async () => {
+      const h = await withStatus();
+      bridge!.setStatus({ menu: "on" });
+      const res = await h.call("ensure_live");
+      expect(res.content?.[0]?.text).toBe("NOT live (maptime 0 -> 0); blockers: a menu is open");
+      expect(res.structuredContent).toMatchObject({ live: false, found: ["a menu is open"] });
+    });
+
+    it("with fix, closes the menu and unblocks, reporting what cleared and what didn't", async () => {
+      const h = await withStatus();
+      bridge!.setStatus({ menu: "on", console: "down", chat: "1", automap: "1" });
+      bridge!.onCommand("closemenu", () => bridge!.setStatus({ menu: "off" }));
+      bridge!.onCommand("mcp_unblock", () => bridge!.setStatus({ console: "up", chat: "0" }));
+      ticking();
+      bridge!.clearReceived();
+      const res = await h.call("ensure_live", { fix: true });
+      expect(res.content?.[0]?.text).toBe(
+        "live (maptime 3 -> 4); fixed: a menu is open, console is down, chat input is open; blockers: automap is open",
+      );
+      expect(res.structuredContent).toMatchObject({
+        fixed: ["a menu is open", "console is down", "chat input is open"],
+        remaining: ["automap is open"],
+      });
+      expect(bridge!.pauses.slice(-1)).toEqual([0]);
+      expect(cmds().filter((c) => /closemenu|mcp_unblock/.test(c))).toHaveLength(2);
+    });
+
+    it("asks for a retry, not a rebuild, when the second status read comes back empty", async () => {
+      const h = await withStatus();
+      bridge!.onCommand("closemenu", () => bridge!.blankStatus());
+      const res = await h.call("ensure_live", { fix: true });
+      expect(res.isError).toBe(true);
+      expect(res.content?.[0]?.text).toBe(
+        "can't check liveness: status read timed out (engine busy, e.g. loading a map); retry",
+      );
+    });
+
+    it("fails when a fix command's own status line comes back without maptime", async () => {
+      const h = await withStatus();
+      bridge!.onCommand("mcp_unblock", () => bridge!.setStatus({ maptime: undefined }));
+      const pauses = bridge!.pauses.length;
+      const res = await h.call("ensure_live", { fix: true });
+      // Caught before the probe: the sim was never unpaused.
+      expect(bridge!.pauses).toHaveLength(pauses);
+      expect(res.isError).toBe(true);
+      expect(res.content?.[0]?.text).toMatch(/^can't check liveness: the engine's status snapshot has no maptime= field/);
+    });
+
+    it("lists a load still pending after the wait as a blocker", async () => {
+      const h = await withStatus();
+      bridge!.setStatus({ pending: "1" });
+      const res = await h.call("ensure_live");
+      expect(res.content?.[0]?.text).toBe("NOT live (maptime 0 -> 0); blockers: a map/save/demo load is pending");
+      expect(res.structuredContent).toMatchObject({ found: ["a map/save/demo load is pending"] });
+    });
+
+    it("waits out a pending load before measuring, so the map change doesn't read as not live", async () => {
+      const h = await withStatus();
+      bridge!.setStatus({ maptime: "6" });
+      bridge!.queueStatus({ pending: "1", maptime: "50" }, { pending: "0", maptime: "1" });
+      const res = await h.call("ensure_live");
+      expect(res.content?.[0]?.text).toBe("live (maptime 1 -> 6); waited for a pending map/save/demo load first");
+      expect(res.structuredContent).toMatchObject({ live: true, found: [] });
+    });
+
+    it("needs the time cap and a maptime= field", async () => {
+      const noTime = await live({ caps: ["cmd", "status"] });
+      expect((await noTime.call("ensure_live")).content?.[0]?.text).toMatch(/no time-control/);
+      await harness!.close();
+      await bridge!.close();
+      const noStatus = await live();
+      expect((await noStatus.call("ensure_live")).content?.[0]?.text).toMatch(/no status support/);
+      await harness!.close();
+      await bridge!.close();
+      const old = await withStatus();
+      bridge!.setStatus({ maptime: undefined });
+      expect((await old.call("ensure_live")).content?.[0]?.text).toMatch(/no maptime= field/);
+    });
+  });
+
+  describe("step_until", () => {
+    const mapvar = (op: string, value: number) => ({ kind: "mapvar", name: "hp", op, value });
+
+    it("steps in chunks until a map var meets the condition, counting map tics", async () => {
+      const h = await withStatus();
+      const out = ["mapvar hp = 0"];
+      let n = 0;
+      bridge!.respondTo("getmapvar", out);
+      bridge!.onCommand("getmapvar", () => (out[0] = `mapvar hp = ${++n * 10}`));
+      ticking();
+      bridge!.clearReceived();
+      const res = await h.call("step_until", { condition: mapvar(">=", 30), maxTics: 100 });
+      expect(res.content?.[0]?.text).toBe("met after 2 tic(s): 30 >= 30");
+      expect(res.structuredContent).toEqual({ met: true, tics: 2, value: 30 });
+      expect(bridge!.pauses.slice(-4)).toEqual([0, 1, 0, 1]);
+    });
+
+    it("returns at once when the condition already holds", async () => {
+      const h = await withStatus({ responses: { getacsvar: ["acsvar global 3 = 7"] } });
+      bridge!.clearReceived();
+      const res = await h.call("step_until", {
+        condition: { kind: "acsvar", scope: "global", index: 3, op: "==", value: 7 },
+        maxTics: 10,
+      });
+      expect(res.content?.[0]?.text).toBe("met after 0 tic(s): 7 == 7");
+      expect(bridge!.pauses).toEqual([]);
+    });
+
+    it("stops at maxTics with a short last chunk", async () => {
+      const h = await withStatus({ responses: { getmaparray: ["maparray a[2] = 1"] } });
+      ticking();
+      const res = await h.call("step_until", {
+        condition: { kind: "maparray", name: "a", index: 2, op: "!=", value: 1 },
+        maxTics: 12,
+      });
+      expect(res.content?.[0]?.text).toBe("not met within 3 tic(s): 1 != 1");
+      expect(res.structuredContent).toMatchObject({ met: false });
+      expect(cmds().filter((c) => c.startsWith("getmaparray"))).toHaveLength(4);
+    });
+
+    it("runs only the tics left in the last chunk", async () => {
+      const sleeps: number[] = [];
+      const h = await withStatus({
+        responses: { getmapvar: ["mapvar hp = 0"] },
+        io: { sleep: (ms) => (sleeps.push(ms), Promise.resolve()) },
+      });
+      ticking();
+      sleeps.length = 0;
+      await h.call("step_until", { condition: mapvar("==", 1), maxTics: 12, chunkTics: 5 });
+      expect(sleeps.map((ms) => Math.round((ms * 35) / 1000))).toEqual([5, 5, 2]);
+    });
+
+    it("compares a player field against a number or another field", async () => {
+      const h = await withStatus({
+        responses: {
+          currentpos: [
+            "Current player position: (1.0,2.0,32.0), angle: 90.0, floorheight: 0.0, sector:4, lightlevel: 160",
+          ],
+        },
+      });
+      ticking();
+      const floor = await h.call("step_until", {
+        condition: { kind: "player", field: "z", op: ">", value: "floorHeight" },
+        maxTics: 5,
+      });
+      expect(floor.content?.[0]?.text).toBe("met after 0 tic(s): 32 > 0");
+      const hp = await h.call("step_until", {
+        condition: { kind: "player", field: "health", op: "<", value: 50 },
+        maxTics: 5,
+      });
+      expect(hp.content?.[0]?.text).toBe("not met within 1 tic(s): 100 < 50");
+    });
+
+    it("fails fast when the sim stops advancing, with the blockers", async () => {
+      const h = await withStatus({ responses: { getmapvar: ["mapvar hp = 0"] } });
+      const clean = await h.call("step_until", { condition: mapvar("==", 1), maxTics: 50 });
+      expect(clean.isError).toBe(true);
+      expect(clean.content?.[0]?.text).toBe(
+        "the sim stopped advancing (maptime stuck at 0); no blocker reported. Try ensure_live with fix.",
+      );
+      bridge!.setStatus({ menu: "on" });
+      const blocked = await h.call("step_until", { condition: mapvar("<=", -1), maxTics: 50 });
+      expect(blocked.content?.[0]?.text).toMatch(/stuck at 0\); a menu is open\./);
+    });
+
+    it("treats a snapshot that loses maptime mid-run as a stall", async () => {
+      const h = await withStatus({ responses: { getmapvar: ["mapvar hp = 0"] } });
+      ticking();
+      let reads = 0;
+      bridge!.onCommand("getmapvar", () => ++reads === 2 && bridge!.setStatus({ maptime: undefined }));
+      const res = await h.call("step_until", { condition: mapvar("==", 1), maxTics: 50 });
+      expect(res.content?.[0]?.text).toMatch(/\(maptime unreadable\); no blocker reported/);
+    });
+
+    it("reports reads that can't be made", async () => {
+      const h = await withStatus({
+        responses: { currentpos: ["Current player position: (0.0,0.0,0.0), angle: 0.0, floorheight: 0.0, sector:0, lightlevel: 0"] },
+      });
+      const errText = async (condition: Record<string, unknown>) =>
+        (await h.call("step_until", { condition, maxTics: 5 })).content?.[0]?.text;
+      expect(await errText(mapvar("==", 1))).toBe("map var 'hp' not found");
+      expect(await errText({ kind: "maparray", name: "a", index: 0, op: "==", value: 1 })).toBe(
+        "map array 'a' not found",
+      );
+      const acsvar = { kind: "acsvar", scope: "world", index: 2, op: "==", value: 1 };
+      expect(await errText(acsvar)).toBe("no value");
+      bridge!.respondTo("getacsvar", ["index out of range (0-255)"]);
+      expect(await errText(acsvar)).toBe("index out of range (0-255)");
+      bridge!.setStatus({ armor: undefined });
+      expect(await errText({ kind: "player", field: "z", op: "==", value: "armor" })).toMatch(/health\/armor/);
+      bridge!.setStatus({ health: undefined });
+      expect(await errText({ kind: "player", field: "health", op: "==", value: 1 })).toMatch(/health\/armor/);
+    });
+
+    it("needs a player, the time cap and a maptime= field", async () => {
+      const h = await withStatus();
+      const noPlayer = await h.call("step_until", {
+        condition: { kind: "player", field: "x", op: "==", value: 0 },
+        maxTics: 5,
+      });
+      expect(noPlayer.content?.[0]?.text).toBe("no player (not in a level?)");
+      bridge!.setStatus({ maptime: undefined });
+      expect((await h.call("step_until", { condition: mapvar("==", 1), maxTics: 5 })).content?.[0]?.text).toMatch(
+        /can't count tics: .*no maptime= field/,
+      );
+      await harness!.close();
+      await bridge!.close();
+      const noTime = await live({ caps: ["cmd", "status"] });
+      expect(
+        (await noTime.call("step_until", { condition: mapvar("==", 1), maxTics: 5 })).content?.[0]?.text,
+      ).toMatch(/no time-control/);
+    });
   });
 });
 
@@ -897,6 +1477,28 @@ describe("diagnostic tools", () => {
     expect(await h.text("get_startup_errors")).toMatch(/Last lines of the engine log[\s\S]*all quiet/);
   });
 
+  it("read_log reports when there is no engine log", async () => {
+    const result = await (await offline()).call("read_log");
+    expect(result.isError).toBe(true);
+    expect(result.content?.[0]?.text).toMatch(/No engine log for instance 1/);
+  });
+
+  it("read_log returns numbered lines without sentinels, with a resume point", async () => {
+    const h = await offline(
+      { exe: "/engine/zandronum" },
+      { existsSync: () => true, readTextSync: () => "a\n__MCPDONE_1__\nGod ON\nb\n" },
+    );
+    const all = await h.call("read_log", { maxLines: 2 });
+    expect(all.content?.[0]?.text).toBe("2 line(s), nextLine=4, 1 more matching line(s) not shown\n3: God ON\n4: b");
+    expect(all.structuredContent).toMatchObject({ nextLine: 4, omitted: 1 });
+    expect(await h.text("read_log", { pattern: "god", sinceLine: 1 })).toBe("1 line(s), nextLine=4\n3: God ON");
+  });
+
+  it("read_log surfaces an invalid pattern as a tool error", async () => {
+    const h = await offline({ exe: "/engine/zandronum" }, { existsSync: () => true, readTextSync: () => "a\n" });
+    expect((await h.call("read_log", { pattern: "(" })).isError).toBe(true);
+  });
+
   it("reports no crash when there is no crash file", async () => {
     const h = await offline({ exe: "/engine/zandronum" }, { existsSync: () => false });
     expect(await h.text("get_crash")).toMatch(/No crash recorded for instance 1/);
@@ -1180,5 +1782,190 @@ describe("engine-state note (registerLive)", () => {
     const result = await h.call("menu_key", { key: "down" });
     expect(result.content).toHaveLength(1);
     expect(cmdsSent()).toHaveLength(0);
+  });
+});
+
+describe("run_acs", () => {
+  const REPLY = "MCP_RUNACS module=2 scripts=3 started=1 deferred=0";
+  const OBJECT = buildBehaviorAcse([], []);
+  const IMPORTING = readFileSync(new URL("./fixtures/runacs-import.o", import.meta.url));
+
+  /** A compileAcs stub that records its requests and the dirs removed after. */
+  function compiler(result: { ok: true; token?: string } | { ok: false; diagnostics: string; exe?: string } = { ok: true }) {
+    const requests: unknown[] = [];
+    const removed: string[] = [];
+    const io: Partial<ContextIo> = {
+      compileAcs: (req) => {
+        requests.push(req);
+        const object = "/tmp/mcp-runacs-1/snippet.o";
+        return result.ok
+          ? { ok: true, dir: "/tmp/mcp-runacs-1", object, token: result.token ?? object }
+          : { ok: false, dir: "/tmp/mcp-runacs-1", diagnostics: result.diagnostics, exe: result.exe };
+      },
+      removeDir: (dir) => void removed.push(dir),
+      readFileSync: () => OBJECT,
+    };
+    return { io, requests, removed };
+  }
+
+  it("compiles with bcc, loads, runs and reports the script's own output", async () => {
+    const c = compiler();
+    const h = await live({ responses: { mcp_runacs: ["runacs ok", "", REPLY] }, io: c.io });
+    const res = await h.call("run_acs", { source: "script 1 (void) {}", script: 1, args: [5, -2] });
+    expect(res.isError).toBeFalsy();
+    expect(c.requests).toEqual([{ compiler: "bcc", exe: undefined, source: "script 1 (void) {}", includeDirs: undefined }]);
+    expect(c.removed).toEqual(["/tmp/mcp-runacs-1"]);
+    expect(cmds()[0]).toMatch(/^mcp_runacs \/tmp\/mcp-runacs-1\/snippet\.o 1 5 -2 ;/);
+    const text = res.content?.[0]?.text ?? "";
+    expect(text).toMatch(/^loaded snippet as module 2 \(3 script\(s\)\), started 1\nrunacs ok\nsave_game refuses/);
+    expect(text).not.toMatch(/DEATH/);
+    expect(res.structuredContent).toEqual({ module: 2, scripts: 3, started: "1", deferred: false, output: ["runacs ok"] });
+  });
+
+  it("uses the configured acc, include dirs, a named script and open, and warns about deferred scripts", async () => {
+    const c = compiler();
+    const h = await live({
+      responses: { mcp_runacs: ["MCP_RUNACS module=0 scripts=2 started=named deferred=1"] },
+      io: c.io,
+      config: { acc: "/opt/acc", bcc: "/opt/bcc" },
+    });
+    const res = await h.call("run_acs", { source: "x", script: "named", compiler: "acc", includeDirs: ["/mod/scripts"], open: true });
+    expect(c.requests[0]).toMatchObject({ compiler: "acc", exe: "/opt/acc", includeDirs: ["/mod/scripts"] });
+    expect(cmds()[0]).toMatch(/^mcp_runacs \/tmp\/mcp-runacs-1\/snippet\.o named open=1 ;/);
+    expect(res.content?.[0]?.text).toMatch(/DEATH\/ENTER\/RESPAWN/);
+    await h.call("run_acs", { source: "x", open: false });
+    expect(cmds()[1]).toMatch(/^mcp_runacs \/tmp\/mcp-runacs-1\/snippet\.o ;/);
+    await h.call("run_acs", { source: "x" });
+    expect(c.requests[2]).toMatchObject({ exe: "/opt/bcc" });
+  });
+
+  it("sends the object as compileAcs's console token, quoted if it has to be", async () => {
+    const c = compiler({ ok: true, token: '"C:/Users/First Last/Temp/mcp-runacs-1/snippet.o"' });
+    const h = await live({ responses: { mcp_runacs: [REPLY] }, io: c.io });
+    const res = await h.call("run_acs", { source: "x", script: 1 });
+    expect(res.isError).toBeFalsy();
+    expect(cmds()[0]).toMatch(/^mcp_runacs "C:\/Users\/First Last\/Temp\/mcp-runacs-1\/snippet\.o" 1 ;/);
+  });
+
+  it("treats a blank configured compiler as unset", async () => {
+    const c = compiler();
+    const h = await live({ responses: { mcp_runacs: [REPLY] }, io: c.io, config: { bcc: "  " } });
+    await h.call("run_acs", { source: "x" });
+    expect(c.requests[0]).toMatchObject({ exe: undefined });
+  });
+
+  it("returns compile diagnostics without sending anything, and still cleans up", async () => {
+    const c = compiler({ ok: false, diagnostics: "snippet.acs:1:30: syntax error" });
+    const h = await live({ io: c.io });
+    const res = await h.call("run_acs", { source: "x", script: 1 });
+    expect(res.isError).toBe(true);
+    expect(res.content?.[0]?.text).toBe("compile failed (bcc), nothing sent to the engine:\nsnippet.acs:1:30: syntax error");
+    expect(cmds()).toHaveLength(0);
+    expect(c.removed).toEqual(["/tmp/mcp-runacs-1"]);
+    const named = await live({ io: compiler({ ok: false, diagnostics: "boom", exe: "/usr/bin/bcc" }).io });
+    expect((await named.call("run_acs", { source: "x" })).content?.[0]?.text).toBe(
+      "compile failed (bcc: /usr/bin/bcc), nothing sent to the engine:\nboom",
+    );
+  });
+
+  it("refuses args without a script, or stepTics without the time cap, before compiling", async () => {
+    const c = compiler();
+    const h = await live({ io: c.io, caps: ["cmd"] });
+    expect(await h.text("run_acs", { source: "x", args: [1] })).toBe("args needs script");
+    expect(await h.text("run_acs", { source: "x", stepTics: 3 })).toMatch(/no time-control support/);
+    expect(c.requests).toHaveLength(0);
+  });
+
+  it("surfaces the engine's refusal with everything it printed", async () => {
+    const c = compiler();
+    const h = await live({
+      responses: {
+        "snippet.o 1": ["Could not find ACS function Foo for use in BEHAVIOR.", "error bad module (unresolved import or import mismatch)"],
+        "snippet.o 2": [],
+      },
+      io: c.io,
+    });
+    const res = await h.call("run_acs", { source: "x", script: 1 });
+    expect(res.isError).toBe(true);
+    expect(res.content?.[0]?.text).toBe(
+      "Could not find ACS function Foo for use in BEHAVIOR.\nerror bad module (unresolved import or import mismatch)",
+    );
+    expect(await h.text("run_acs", { source: "x", script: 2 })).toBe("(no output)");
+  });
+
+  it("steps the sim and returns the log lines printed meanwhile", async () => {
+    let reads = 0;
+    const logs = ["a\nb\n", "a\nb\nafter delay\n"];
+    const c = compiler();
+    const h = await live({
+      responses: { mcp_runacs: ["before delay", REPLY] },
+      config: { exe: "/engine/zandronum" },
+      io: { ...c.io, existsSync: () => true, readTextSync: () => logs[Math.min(reads++, 1)] },
+    });
+    const res = await h.call("run_acs", { source: "x", script: 2, stepTics: 2 });
+    await settle(() => bridge!.pauses.length === 2);
+    expect(bridge!.pauses).toEqual([0, 1]);
+    expect(res.content?.[0]?.text).toMatch(/\nbefore delay\nlog after 2 tic\(s\):\nafter delay\n/);
+    expect(res.structuredContent?.log).toEqual(["after delay"]);
+  });
+
+  it("says so when there is no engine log to read after stepping", async () => {
+    const c = compiler();
+    const h = await live({ responses: { mcp_runacs: [REPLY] }, io: c.io });
+    const res = await h.call("run_acs", { source: "x", script: 1, stepTics: 1 });
+    expect(res.content?.[0]?.text).toMatch(/ran 1 tic\(s\); no engine log to read/);
+    expect(res.structuredContent?.log).toBeUndefined();
+  });
+
+  it("makes save_game refuse while a snippet module is loaded", async () => {
+    const h = await withStatus();
+    bridge!.setStatus({ acstemp: "2" });
+    const res = await h.call("save_game", { name: "s1" });
+    expect(res.isError).toBe(true);
+    expect(res.content?.[0]?.text).toMatch(/^refused: 2 run_acs snippet module\(s\) are loaded/);
+    expect(cmds().some((t) => t.startsWith("save "))).toBe(false);
+    bridge!.setStatus({ acstemp: "0" });
+    bridge!.respondTo("save s1", ["Game saved."]);
+    expect((await h.call("save_game", { name: "s1" })).isError).toBe(false);
+    expect(cmds().some((t) => /^mcp_status ;/.test(t))).toBe(false);
+  });
+
+  it("makes save_game refuse when the status read comes back empty", async () => {
+    const h = await withStatus();
+    bridge!.blankStatus();
+    const res = await h.call("save_game", { name: "s1" });
+    expect(res.isError).toBe(true);
+    expect(res.content?.[0]?.text).toMatch(/^refused: status read timed out/);
+    expect(cmds().some((t) => t.startsWith("save "))).toBe(false);
+  });
+
+  it("sends a snippet whose imports are all loaded", async () => {
+    const c = compiler();
+    const h = await live({
+      responses: { dumpmodules: ["MCP_MODULES", "module 0 MCPLIB"], mcp_runacs: [REPLY] },
+      io: { ...c.io, readFileSync: () => IMPORTING },
+    });
+    expect((await h.call("run_acs", { source: "x", script: 1 })).isError).toBeFalsy();
+    expect(cmds().filter((t) => t.startsWith("mcp_runacs"))).toHaveLength(1);
+  });
+
+  it("refuses an import that isn't loaded before sending anything (Zandronum can't unload it)", async () => {
+    const c = compiler();
+    const h = await live({
+      responses: { dumpmodules: ["MCP_MODULES", "module 0 OTHER"] },
+      io: { ...c.io, readFileSync: () => IMPORTING },
+    });
+    expect(await h.text("run_acs", { source: "x", script: 1 })).toBe(
+      "imports mcplib, not loaded in this level; nothing sent to the engine",
+    );
+    expect(cmds().some((t) => t.startsWith("mcp_runacs"))).toBe(false);
+    expect(c.removed).toEqual(["/tmp/mcp-runacs-1"]);
+  });
+
+  it("refuses compiler output that isn't an ACS object", async () => {
+    const c = compiler();
+    const h = await live({ io: { ...c.io, readFileSync: () => Buffer.from("not bytecode") } });
+    expect(await h.text("run_acs", { source: "x" })).toBe("bcc produced no ACS object; nothing sent to the engine");
+    expect(cmds()).toHaveLength(0);
   });
 });

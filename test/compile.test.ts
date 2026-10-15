@@ -1,0 +1,357 @@
+import { describe, it, expect } from "vitest";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import {
+  compileAcs,
+  consolePath,
+  defaultCompileDeps,
+  findOnPath,
+  pathExts,
+  removeDir,
+  type CompileDeps,
+} from "../src/acs/compile.js";
+
+/** A POSIX-style fixture path as compileAcs resolves it on this OS (`C:\\opt\\bcc` on Windows). */
+const abs = (p: string) => path.resolve(p);
+// Not the real temp folder: a non-ASCII one on Windows would make every fake-deps compile refuse.
+const DIR = abs("/tmp/mcp-runacs-x");
+/** A file in the fake temp dir, joined the way compileAcs joins it on this OS. */
+const at = (file: string) => path.join(DIR, file);
+
+/**
+ * Deps that record writes and exec calls: `fail` makes exec throw it, `files` are executables
+ * unless listed in `plain`, `path` is PATH, and `links` maps a path to its realpath.
+ */
+function fakeDeps(
+  opts: {
+    dir?: string;
+    fail?: unknown;
+    path?: string[];
+    files?: string[];
+    plain?: string[];
+    links?: Record<string, string>;
+    exts?: string[];
+  } = {},
+) {
+  const written = new Map<string, string>();
+  const calls: Array<{ exe: string; args: string[]; cwd: string }> = [];
+  const files = new Set((opts.files ?? []).map(abs));
+  const plain = new Set((opts.plain ?? []).map(abs));
+  const links = new Map(Object.entries(opts.links ?? {}).map(([k, v]) => [abs(k), abs(v)]));
+  const deps: CompileDeps = {
+    mkdtemp: () => opts.dir ?? DIR,
+    writeFile: (p, text) => void written.set(p, text),
+    exec: (exe, args, cwd) => {
+      calls.push({ exe, args, cwd });
+      if (opts.fail !== undefined) throw opts.fail;
+    },
+    pathEnv: () => opts.path?.map(abs).join(path.delimiter),
+    exeExts: opts.exts ?? [""],
+    isExec: (p) => files.has(p) && !plain.has(p),
+    realpath: (p) => links.get(p) ?? p,
+    exists: (p) => files.has(p),
+  };
+  return { deps, written, calls };
+}
+
+const BCC = { files: ["/opt/bcc"] };
+
+describe("compileAcs", () => {
+  it("wraps a non-library snippet as a library and compiles the wrapper", () => {
+    const { deps, written, calls } = fakeDeps(BCC);
+    const res = compileAcs({ compiler: "bcc", exe: "/opt/bcc", source: "script 1 (void) {}", includeDirs: ["/a", "/b"] }, deps);
+    expect(res).toEqual({ ok: true, dir: DIR, object: at("snippet.o"), ...consolePath(at("snippet.o")) });
+    expect(written.get(at("snippet.acs"))).toBe("script 1 (void) {}");
+    expect(written.get(at("wrap.acs"))).toBe('#library "mcpsnip"\n#include "snippet.acs"\n');
+    expect(calls).toEqual([
+      { exe: abs("/opt/bcc"), args: ["-i", abs("/a"), "-i", abs("/b"), "wrap.acs", at("snippet.o")], cwd: DIR },
+    ]);
+  });
+
+  it("compiles a snippet that is already a #library directly", () => {
+    const { deps, written, calls } = fakeDeps({ files: ["/opt/acc"] });
+    compileAcs({ compiler: "acc", exe: "/opt/acc", source: '  #LIBRARY "mine"\nscript 1 (void) {}' }, deps);
+    expect(written.has(at("wrap.acs"))).toBe(false);
+    expect(calls[0].args).toEqual(["snippet.acs", at("snippet.o")]);
+  });
+
+  it("refuses a temp dir that can't travel as one console token, naming why and the remedy", () => {
+    const { deps, calls } = fakeDeps({ ...BCC, dir: "/tmp/semi;colon" });
+    const res = compileAcs({ compiler: "bcc", exe: "/opt/bcc", source: "x" }, deps);
+    expect(res).toMatchObject({
+      ok: false,
+      dir: "/tmp/semi;colon",
+      diagnostics: expect.stringMatching(/console token: it contains ";"\. Set TMPDIR \(TEMP on Windows\)/),
+    });
+    expect(calls).toHaveLength(0);
+  });
+
+  it("passes a temp dir with a space as a quoted token, keeping the real object path", () => {
+    const dir = abs("/tmp/has space/mcp-runacs-x");
+    const { deps, calls } = fakeDeps({ ...BCC, dir });
+    const res = compileAcs({ compiler: "bcc", exe: "/opt/bcc", source: "x" }, deps);
+    const object = path.join(dir, "snippet.o");
+    expect(res).toMatchObject({ ok: true, object, token: `"${object.replaceAll("\\", "/")}"` });
+    expect(calls[0].args.at(-1)).toBe(object);
+  });
+
+  it("searches PATH for zt-bcc before bcc whatever the PATH order, and for acc", () => {
+    const only = fakeDeps({ path: ["/usr/bin"], files: ["/usr/bin/bcc"] });
+    compileAcs({ compiler: "bcc", source: "x" }, only.deps);
+    expect(only.calls[0].exe).toBe(abs("/usr/bin/bcc"));
+    const both = fakeDeps({ path: ["/usr/bin", "/usr/local/bin"], files: ["/usr/bin/bcc", "/usr/local/bin/zt-bcc"] });
+    compileAcs({ compiler: "bcc", source: "x" }, both.deps);
+    expect(both.calls[0].exe).toBe(abs("/usr/local/bin/zt-bcc"));
+    const acc = fakeDeps({ path: ["/usr/bin"], files: ["/usr/bin/acc"] });
+    compileAcs({ compiler: "acc", source: "x" }, acc.deps);
+    expect(acc.calls[0].exe).toBe(abs("/usr/bin/acc"));
+  });
+
+  it("resolves relative paths and includeDirs against the server's cwd, not the temp dir the compiler runs in", () => {
+    const abs = path.resolve("tools/zt-bcc");
+    const { deps, calls } = fakeDeps({ files: [abs] });
+    compileAcs({ compiler: "bcc", exe: "tools/zt-bcc", source: "x", includeDirs: ["mods"] }, deps);
+    expect(calls[0]).toMatchObject({ exe: abs, args: ["-i", path.resolve("mods"), "wrap.acs", expect.any(String)] });
+  });
+
+  it("looks a configured bare name up on PATH", () => {
+    const { deps, calls } = fakeDeps({ path: ["/opt/zt"], files: ["/opt/zt/zt-bcc"] });
+    compileAcs({ compiler: "bcc", exe: "zt-bcc", source: "x" }, deps);
+    expect(calls[0].exe).toBe(abs("/opt/zt/zt-bcc"));
+    expect(compileAcs({ compiler: "acc", exe: "acc", source: "x" }, deps)).toMatchObject({
+      diagnostics: "compiler acc (set by ZANDRONUM_ACC) not found on PATH.",
+    });
+  });
+
+  it("adds the platform's executable suffix to a configured path without one", () => {
+    const { deps, calls } = fakeDeps({ files: ["/tools/zt-bcc.exe", "/tools/acc.exe"], exts: [".exe"] });
+    compileAcs({ compiler: "bcc", exe: "/tools/zt-bcc", source: "x" }, deps);
+    compileAcs({ compiler: "acc", exe: "/tools/acc.exe", source: "x" }, deps);
+    expect(calls.map((c) => c.exe)).toEqual([abs("/tools/zt-bcc.exe"), abs("/tools/acc.exe")]);
+  });
+
+  it("says what to install and set when no compiler is found, without writing or running anything", () => {
+    const none = fakeDeps({ files: ["/opt/zt-bcc/lib/zcommon.acs", "/opt/zt-bcc/zt-bcc"], plain: ["/opt/zt-bcc/zt-bcc"] });
+    expect(compileAcs({ compiler: "bcc", source: "x" }, none.deps)).toEqual({
+      ok: false,
+      dir: DIR,
+      diagnostics:
+        "no ACS compiler found: tried zt-bcc, bcc on PATH. run_acs needs zt-bcc (https://github.com/zeta-group/zt-bcc): " +
+        "put it on PATH or set ZANDRONUM_BCC to its path in the MCP server's env.",
+    });
+    expect(compileAcs({ compiler: "acc", source: "x" }, none.deps)).toMatchObject({
+      diagnostics: expect.stringMatching(/^no ACS compiler found: tried acc on PATH\. run_acs needs acc \(https:\/\/github\.com\/ZDoom\/acc\): .* set ZANDRONUM_ACC /),
+    });
+    expect(compileAcs({ compiler: "acc", exe: "/no/acc", source: "x" }, none.deps)).toMatchObject({
+      diagnostics: "compiler /no/acc (set by ZANDRONUM_ACC) not found.",
+    });
+    expect(compileAcs({ compiler: "bcc", exe: "/opt/zt-bcc/zt-bcc", source: "x" }, none.deps)).toMatchObject({
+      diagnostics: "compiler /opt/zt-bcc/zt-bcc (set by ZANDRONUM_BCC) is not an executable file.",
+    });
+    expect(none.calls).toHaveLength(0);
+    expect(none.written.size).toBe(0);
+  });
+
+  it("tells Windows users only .exe files run", () => {
+    const { deps } = fakeDeps({ exts: [".exe"] });
+    expect(compileAcs({ compiler: "bcc", source: "x" }, deps)).toMatchObject({
+      diagnostics: expect.stringMatching(/env\. Only \.exe files run, not \.cmd\/\.bat wrappers\.$/),
+    });
+    expect(compileAcs({ compiler: "bcc", exe: "/x/zt-bcc.cmd", source: "x" }, deps)).toMatchObject({
+      diagnostics: "compiler /x/zt-bcc.cmd (set by ZANDRONUM_BCC) not found. Only .exe files run, not .cmd/.bat wrappers.",
+    });
+  });
+
+  it("names the binary when it can't start", () => {
+    const { deps } = fakeDeps({ path: ["/usr/bin"], files: ["/usr/bin/bcc"], fail: { code: "ENOENT" } });
+    expect(compileAcs({ compiler: "bcc", source: "x" }, deps)).toMatchObject({
+      diagnostics: `couldn't start ${abs("/usr/bin/bcc")} (ENOENT: a broken link or a missing script interpreter?)`,
+      exe: abs("/usr/bin/bcc"),
+    });
+  });
+
+  it("adds zt-bcc's lib/ found beside or one above the real binary, after the caller's dirs", () => {
+    const beside = fakeDeps({
+      path: ["/usr/local/bin"],
+      files: ["/usr/local/bin/zt-bcc", "/src/zt-bcc/lib/zcommon.acs"],
+      links: { "/usr/local/bin/zt-bcc": "/src/zt-bcc/zt-bcc" },
+    });
+    compileAcs({ compiler: "bcc", source: "x", includeDirs: ["/mod"] }, beside.deps);
+    expect(beside.calls[0]).toMatchObject({
+      exe: abs("/usr/local/bin/zt-bcc"),
+      args: ["-i", abs("/mod"), "-i", abs("/src/zt-bcc/lib"), "wrap.acs", expect.any(String)],
+    });
+    // A configured link is followed too.
+    const above = fakeDeps({
+      files: ["/usr/local/bin/zt-bcc", "/src/zt-bcc/lib/zcommon.acs"],
+      links: { "/usr/local/bin/zt-bcc": "/src/zt-bcc/build/zt-bcc" },
+    });
+    compileAcs({ compiler: "bcc", exe: "/usr/local/bin/zt-bcc", source: "x" }, above.deps);
+    expect(above.calls[0]).toMatchObject({ exe: abs("/usr/local/bin/zt-bcc"), args: ["-i", abs("/src/zt-bcc/lib"), "wrap.acs", expect.any(String)] });
+    const both = fakeDeps({ files: ["/src/zt-bcc/build/zt-bcc", "/src/zt-bcc/build/lib/zcommon.acs", "/src/zt-bcc/lib/zcommon.acs"] });
+    compileAcs({ compiler: "bcc", exe: "/src/zt-bcc/build/zt-bcc", source: "x" }, both.deps);
+    expect(both.calls[0].args.slice(0, 2)).toEqual(["-i", abs("/src/zt-bcc/build/lib")]);
+  });
+
+  it("adds no lib/ when includeDirs already reaches zcommon.acs, when there is none, or for acc", () => {
+    const files = ["/src/zt-bcc/zt-bcc", "/src/zt-bcc/lib/zcommon.acs", "/mine/zcommon.acs", "/src/acc/acc", "/src/acc/lib/zcommon.acs"];
+    const { deps, calls } = fakeDeps({ files });
+    compileAcs({ compiler: "bcc", exe: "/src/zt-bcc/zt-bcc", source: "x", includeDirs: ["/mine"] }, deps);
+    compileAcs({ compiler: "acc", exe: "/src/acc/acc", source: "x" }, deps);
+    const bare = fakeDeps(BCC);
+    compileAcs({ compiler: "bcc", exe: "/opt/bcc", source: "x" }, bare.deps);
+    expect(calls[0].args.slice(0, 3)).toEqual(["-i", abs("/mine"), "wrap.acs"]);
+    expect(calls[1].args[0]).toBe("wrap.acs");
+    expect(bare.calls[0].args[0]).toBe("wrap.acs");
+  });
+
+  it("returns the compiler's diagnostics and which binary ran, dropping acc's banner", () => {
+    const bcc = { stdout: "", stderr: Buffer.from("snippet.acs:1:30: syntax error\n") };
+    expect(compileAcs({ compiler: "bcc", exe: "/opt/bcc", source: "x" }, fakeDeps({ ...BCC, fail: bcc }).deps)).toEqual({
+      ok: false,
+      dir: DIR,
+      diagnostics: "snippet.acs:1:30: syntax error",
+      exe: abs("/opt/bcc"),
+    });
+    const acc = { stdout: "Original ACC Version 1.10\n**** ERROR ****\nsnippet.acs:1: Missing semicolon.\n" };
+    expect(compileAcs({ compiler: "acc", exe: "/opt/bcc", source: "x" }, fakeDeps({ ...BCC, fail: acc }).deps)).toMatchObject({
+      diagnostics: "**** ERROR ****\nsnippet.acs:1: Missing semicolon.",
+    });
+    const bare = new Error("spawnSync bcc ETIMEDOUT");
+    expect(compileAcs({ compiler: "bcc", exe: "/opt/bcc", source: "x" }, fakeDeps({ ...BCC, fail: bare }).deps)).toMatchObject({
+      diagnostics: "spawnSync bcc ETIMEDOUT",
+    });
+  });
+
+  it("explains where zcommon.acs lives only when the compiler couldn't load it", () => {
+    const bcc = { stderr: 'snippet.acs:1:9: error: failed to load file: "zcommon.acs"\n' };
+    expect(compileAcs({ compiler: "bcc", exe: "/opt/bcc", source: "x" }, fakeDeps({ ...BCC, fail: bcc }).deps)).toMatchObject({
+      diagnostics:
+        'snippet.acs:1:9: error: failed to load file: "zcommon.acs"\n' +
+        "(zcommon.acs is in zt-bcc's lib/ folder: pass that folder in includeDirs, or keep lib/ next to or one folder above the zt-bcc binary, where it's found automatically)",
+    });
+    const acc = { stdout: '**** ERROR ****\nsnippet.acs:1: Couldn\'t find include file "zcommon.acs".\n' };
+    expect(compileAcs({ compiler: "acc", exe: "/opt/bcc", source: "x" }, fakeDeps({ ...BCC, fail: acc }).deps)).toMatchObject({
+      diagnostics: expect.stringMatching(/"zcommon\.acs"\.\n\(zcommon\.acs is in acc's include folder: pass that folder in includeDirs\)$/),
+    });
+    const twice = { stderr: "snippet.acs:2:9: error: #including zcommon.acs file multiple times\n" };
+    expect(compileAcs({ compiler: "bcc", exe: "/opt/bcc", source: "x" }, fakeDeps({ ...BCC, fail: twice }).deps)).toMatchObject({
+      diagnostics: "snippet.acs:2:9: error: #including zcommon.acs file multiple times",
+    });
+  });
+
+  it.skipIf("refused" in consolePath(path.join(tmpdir(), "x")))("uses the real filesystem and process by default", () => {
+    const res = compileAcs({ compiler: "bcc", exe: "/no/such/bcc", source: "script 1 (void) {}" });
+    // Windows appends the .exe-only hint.
+    expect(res).toMatchObject({ ok: false, diagnostics: expect.stringMatching(/^compiler \/no\/such\/bcc \(set by ZANDRONUM_BCC\) not found\./) });
+    expect(existsSync(res.dir)).toBe(true);
+    removeDir(res.dir);
+    expect(existsSync(res.dir)).toBe(false);
+  });
+
+  // A #!/bin/sh script made executable with chmod: POSIX only.
+  it.skipIf(process.platform === "win32")("runs a real compiler process by default", () => {
+    const bin = mkdtempSync(path.join(tmpdir(), "mcp-fakebcc-"));
+    const exe = path.join(bin, "zt-bcc");
+    writeFileSync(exe, '#!/bin/sh\necho "wrap.acs:1:1: error: $1 $2" >&2\nexit 1\n');
+    chmodSync(exe, 0o755);
+    const ran = compileAcs({ compiler: "bcc", exe, source: "x" });
+    expect(ran).toMatchObject({ ok: false, diagnostics: "wrap.acs:1:1: error: wrap.acs " + path.join(ran.dir, "snippet.o") });
+    removeDir(ran.dir);
+    removeDir(bin);
+  });
+
+  it("removeDir is a no-op on a missing dir and removes a full one", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "mcp-rm-"));
+    writeFileSync(path.join(dir, "f"), "x");
+    removeDir(dir);
+    removeDir(dir);
+    expect(existsSync(dir)).toBe(false);
+  });
+});
+
+describe("consolePath", () => {
+  const ok = (token: string) => ({ token });
+  const refused = { refused: expect.any(String) };
+
+  it("leaves a plain POSIX path as-is and quotes one with a space or non-ASCII", () => {
+    expect(consolePath("/tmp/mcp-runacs-x/snippet.o", "linux")).toEqual(ok("/tmp/mcp-runacs-x/snippet.o"));
+    expect(consolePath("/tmp/a b/snippet.o", "linux")).toEqual(ok('"/tmp/a b/snippet.o"'));
+    expect(consolePath("/srv/José/snippet.o", "linux")).toEqual(ok('"/srv/José/snippet.o"'));
+    expect(consolePath("$HOME/x.o", "linux")).toEqual(ok('"$HOME/x.o"'));
+    // Bare, the console keeps `\` literally; quoted, `\c` would become a colour escape.
+    expect(consolePath("/tmp/odd\\cname/x.o", "linux")).toEqual(ok("/tmp/odd\\cname/x.o"));
+    expect(consolePath("/tmp/a b\\cname/x.o", "linux")).toEqual(refused);
+  });
+
+  it("gives Windows paths / separators, quoted only when they have a space", () => {
+    expect(consolePath("C:\\Users\\First Last\\AppData\\Local\\Temp\\mcp-runacs-x\\snippet.o", "win32")).toEqual(
+      ok('"C:/Users/First Last/AppData/Local/Temp/mcp-runacs-x/snippet.o"'),
+    );
+    expect(consolePath("C:\\Temp\\mcp-runacs-x\\snippet.o", "win32")).toEqual(ok("C:/Temp/mcp-runacs-x/snippet.o"));
+    expect(consolePath("C:\\Users\\a b\\cache\\x.o", "win32")).toEqual(ok('"C:/Users/a b/cache/x.o"'));
+    expect(consolePath("\\\\srv\\share\\t\\x.o", "win32")).toEqual(ok("//srv/share/t/x.o"));
+  });
+
+  it("refuses non-ASCII on Windows, and quotes, semicolons and control characters but tab anywhere", () => {
+    expect(consolePath("C:\\Users\\José\\x.o", "win32")).toEqual({ refused: expect.stringMatching(/non-ASCII path \("é"\) on Windows/) });
+    expect(consolePath("/tmp/a\tb/x.o", "linux")).toEqual(ok('"/tmp/a\tb/x.o"'));
+    for (const p of ['/tmp/a"b/x.o', "/tmp/a;b/x.o", "/tmp/a\nb/x.o", "/tmp/a\rb/x.o", "/tmp/a\x01b/x.o", "/tmp/a\x1fb/x.o"]) {
+      expect(consolePath(p, "linux")).toEqual(refused);
+      expect(consolePath(p, "win32")).toEqual(refused);
+    }
+  });
+
+  it("defaults to this platform", () => {
+    expect(consolePath("x.o")).toEqual(ok("x.o"));
+  });
+});
+
+describe("compiler lookup", () => {
+  it("findOnPath walks PATH in order, trying each suffix and skipping empty entries", () => {
+    const seen: string[] = [];
+    const isExec = (p: string) => (seen.push(p), p === path.resolve("/b", "zt-bcc.exe"));
+    const envPath = ["", "/a", "/b"].join(path.delimiter);
+    expect(findOnPath("zt-bcc", envPath, ["", ".exe"], isExec)).toBe(path.resolve("/b", "zt-bcc.exe"));
+    expect(seen).toEqual(["/a/zt-bcc", "/a/zt-bcc.exe", "/b/zt-bcc", "/b/zt-bcc.exe"].map((p) => path.resolve(p)));
+    expect(findOnPath("zt-bcc", undefined, [""], isExec)).toBeUndefined();
+  });
+
+  it("findOnPath takes a name that already has a suffix as-is, and resolves a relative PATH entry", () => {
+    const seen: string[] = [];
+    findOnPath("zt-bcc.exe", "bin", [".exe"], (p) => (seen.push(p), false));
+    expect(seen).toEqual([path.resolve("bin", "zt-bcc.exe")]);
+  });
+
+  it("pathExts only tries .exe on Windows, where execFile can't run a .cmd wrapper", () => {
+    expect(pathExts("win32")).toEqual([".exe"]);
+    expect(pathExts("linux")).toEqual([""]);
+  });
+
+  it("findOnPath strips the quotes a Windows PATH entry may carry", () => {
+    const seen: string[] = [];
+    findOnPath("zt-bcc", '"/Program Files/zt"', [""], (p) => (seen.push(p), false));
+    expect(seen).toEqual([path.resolve("/Program Files/zt", "zt-bcc")]);
+  });
+
+  it.skipIf(process.platform === "win32")("the default deps see executable files, PATH and symlinks", () => {
+    const dir = realpathSync(mkdtempSync(path.join(tmpdir(), "mcp-which-")));
+    const exe = path.join(dir, "fake-bcc");
+    writeFileSync(exe, "#!/bin/sh\n");
+    chmodSync(exe, 0o755);
+    writeFileSync(path.join(dir, "plain"), "x");
+    mkdirSync(path.join(dir, "subdir"));
+    symlinkSync(exe, path.join(dir, "link"));
+    expect(defaultCompileDeps.isExec(exe)).toBe(true);
+    expect(defaultCompileDeps.isExec(path.join(dir, "plain"))).toBe(false);
+    expect(defaultCompileDeps.isExec(path.join(dir, "subdir"))).toBe(false);
+    expect(defaultCompileDeps.isExec(path.join(dir, "missing"))).toBe(false);
+    expect(defaultCompileDeps.realpath(path.join(dir, "link"))).toBe(exe);
+    expect(defaultCompileDeps.realpath(path.join(dir, "missing"))).toBe(path.join(dir, "missing"));
+    expect(defaultCompileDeps.exists(exe)).toBe(true);
+    expect(defaultCompileDeps.pathEnv()).toBe(process.env.PATH);
+    expect(defaultCompileDeps.exeExts).toEqual(pathExts(process.platform));
+    removeDir(dir);
+  });
+});

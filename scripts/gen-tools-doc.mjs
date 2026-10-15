@@ -87,7 +87,7 @@ visit(sf);
 // guard: the registerLive rollout showed that a call-form the visitor doesn't
 // recognize silently drops JUST those tools (43 of them, that time) rather
 // than emitting nothing — a `length === 0` check would never have caught it.
-const MIN_EXPECTED_TOOLS = 55;
+const MIN_EXPECTED_TOOLS = 66;
 if (tools.length < MIN_EXPECTED_TOOLS) {
   console.error(
     `Found only ${tools.length} tools (expected at least ${MIN_EXPECTED_TOOLS}) — ` +

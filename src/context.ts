@@ -5,6 +5,7 @@ import { findFreePort } from "./process/launch.js";
 import { reapOrphanEngines, defaultIo as defaultReapIo, type ReapResult, type ReapOptions } from "./process/reap.js";
 import { hasBridge } from "./process/verify.js";
 import { buildIndex, type AcsIndex } from "./acs/symbols.js";
+import { compileAcs, removeDir, type CompileRequest, type CompileResult } from "./acs/compile.js";
 import { readMapFromContainer, type MapData } from "./map/index.js";
 import { captureScreenshot } from "./screenshot/capture.js";
 import type { BridgeClient } from "./bridge/transport.js";
@@ -19,6 +20,9 @@ export interface ServerConfig {
   iwad?: string;
   acsSrc?: string;
   saveDir?: string;
+  /** `run_acs` compilers; default to `zt-bcc`/`bcc` or `acc` on PATH. */
+  bcc?: string;
+  acc?: string;
 }
 
 /**
@@ -35,11 +39,17 @@ export interface ContextIo {
   sleep: (ms: number) => Promise<void>;
   /** Run `fn` every `ms` until the returned cancel is called. */
   every: (ms: number, fn: () => void) => () => void;
-  capture: (client: BridgeClient, dir: string) => Promise<{ base64: string }>;
+  capture: (
+    client: BridgeClient,
+    dir: string,
+    opts?: { name?: string; keep?: boolean },
+  ) => Promise<{ base64: string; path: string }>;
   findFreePort: (start: number) => Promise<number>;
   hasBridge: (exe: string) => boolean;
   reap: (exe: string, opts?: ReapOptions) => Promise<ReapResult>;
   launchIo: LaunchIo;
+  compileAcs: (req: CompileRequest) => CompileResult;
+  removeDir: (dir: string) => void;
 }
 
 export const defaultContextIo: ContextIo = {
@@ -58,11 +68,13 @@ export const defaultContextIo: ContextIo = {
     timer.unref?.();
     return () => clearInterval(timer);
   },
-  capture: (client, dir) => captureScreenshot(client, { dir }),
+  capture: (client, dir, opts) => captureScreenshot(client, { dir, ...opts }),
   findFreePort: (start) => findFreePort(start),
   hasBridge: (exe) => hasBridge(exe),
   reap: (exe, opts) => reapOrphanEngines(exe, defaultReapIo, opts),
   launchIo: defaultLaunchIo,
+  compileAcs: (req) => compileAcs(req),
+  removeDir: (dir) => removeDir(dir),
 };
 
 /**
@@ -150,6 +162,12 @@ export class ServerContext {
     return this.config.exe
       ? path.join(path.dirname(this.config.exe), `mcp-bridge-${this.effectivePort(instance)}.log`)
       : undefined;
+  }
+
+  /** An instance's engine console log text, or undefined when there is none to read. */
+  readLog(instance: number): string | undefined {
+    const logFile = this.logPathFor(instance);
+    return logFile && this.io.existsSync(logFile) ? this.io.readTextSync(logFile) : undefined;
   }
 
   /**

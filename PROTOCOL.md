@@ -66,9 +66,9 @@ On a bridge advertising the `status` cap, the client uses `mcp_status <sentinel>
 as the correlator instead of `echo <sentinel>` — the same sentinel value, but the
 CCMD echoes it back as the leading token of a single line also carrying the
 engine's state (`<sentinel> paused=0 menu=off console=up gamestate=level
-player=alive spectating=0 demo=0 automap=0 chat=0 demorec=0 pending=0
-health=100 armor=0`, with `health`/`armor`/`menuclass` present only when there's
-a live player actor / an open menu).
+player=alive spectating=0 demo=0 automap=0 chat=0 demorec=0 pending=0 maptime=35
+acstemp=0 health=100 armor=0 cheats=0`, with `health`/`armor`/`cheats`/`menuclass` present
+only when there's a live player actor / an open menu).
 
 | Field | Values | Meaning |
 |---|---|---|
@@ -81,7 +81,10 @@ a live player actor / an open menu).
 | `demo` / `demorec` | `0`, `1` | playing back / recording a demo |
 | `automap` / `chat` | `0`, `1` | automap open / chat input open |
 | `pending` | `0`, `1` | a map, savegame or demo load (`map`, `load`, `playdemo`) is queued for the next tic, so the other fields still describe the state before it. Other queued actions (screenshot, automap toggle, autosave, level exit) don't count |
+| `maptime` | integer | tics run on the current map (`level.maptime`); `ensure_live`/`step_until` watch it move |
+| `acstemp` | integer | `run_acs` snippet modules loaded in this level; `save_game` refuses while nonzero |
 | `health` / `armor` | integers | console player's health and armor amount |
+| `cheats` | integer | console player's `cheats` bits (`CF_GODMODE`, `CF_NOTARGET`, ...), read by `set_cheat` |
 | `menuclass` | class name | the open menu's class |
 
 That line is excluded from command output

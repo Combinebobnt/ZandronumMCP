@@ -9,6 +9,9 @@ const MAGIC_ACSE = 0x45534341; // "ACSE"
 const MAGIC_ACSe = 0x65534341; // "ACSe"
 const ID_FNAM = 0x4d414e46; // "FNAM"
 const ID_SNAM = 0x4d414e53; // "SNAM"
+const ID_MEXP = 0x5058454d; // "MEXP"
+const ID_ARAY = 0x59415241; // "ARAY"
+const ID_LOAD = 0x44414f4c; // "LOAD"
 
 export interface BytecodeNames {
   functions: string[];
@@ -70,4 +73,64 @@ export function parseBehaviorNames(lump: Buffer): BytecodeNames {
     functions: fnam >= 0 ? readNameChunk(lump, fnam) : [],
     namedScripts: snam >= 0 ? readNameChunk(lump, snam) : [],
   };
+}
+
+/** Whether a buffer starts with one of the ACS bytecode magics. */
+export function hasAcsMagic(buf: Buffer): boolean {
+  return buf.length >= 4 && [MAGIC_ACS0, MAGIC_ACSE, MAGIC_ACSe].includes(buf.readUInt32LE(0));
+}
+
+/** Whether a buffer is loadable ACS bytecode at all (FBehavior's magic + 32-byte floor). */
+export function isAcsObject(lump: Buffer): boolean {
+  return lump.length >= 32 && hasAcsMagic(lump);
+}
+
+/** Libraries an object imports: the LOAD chunk's NUL-separated names (p_acs.cpp, "Load required libraries"). */
+export function parseLoadNames(lump: Buffer): string[] {
+  const region = locateChunks(lump);
+  if (!region) return [];
+  const load = findChunk(lump, region, ID_LOAD);
+  if (load < 0) return [];
+  const size = lump.readUInt32LE(load + 4);
+  return lump.toString("latin1", load + 8, load + 8 + size).split("\0").filter((n) => n.length > 0);
+}
+
+/** The imports none of the `loaded` module names satisfies, matched as the engine does: 8-character lump names, case-insensitively. */
+export function missingImports(imports: string[], loaded: string[]): string[] {
+  const have = new Set(loaded.map((n) => n.toUpperCase()));
+  return imports.filter((n) => !have.has(n.slice(0, 8).toUpperCase()));
+}
+
+export interface MapExport {
+  name: string;
+  /** Map variable slot; MEXP entry i names slot i (FindMapVarName, p_acs.cpp). */
+  index: number;
+  isArray: boolean;
+  /** Element count, for arrays only. */
+  size?: number;
+}
+
+/**
+ * Exported map variables and arrays, the only names get_map_var/get_map_array can see:
+ * MEXP is a name chunk, ARAY is [slot][size] pairs (p_acs.cpp, "Create arrays").
+ */
+export function parseMapExports(lump: Buffer): MapExport[] {
+  const region = locateChunks(lump);
+  if (!region) return [];
+  const mexp = findChunk(lump, region, ID_MEXP);
+  if (mexp < 0) return [];
+  const sizes = new Map<number, number>();
+  const aray = findChunk(lump, region, ID_ARAY);
+  if (aray >= 0) {
+    // A corrupt size can't read past the lump (readUInt32LE throws there).
+    const count = Math.floor(Math.min(lump.readUInt32LE(aray + 4), lump.length - aray - 8) / 8);
+    for (let i = 0; i < count; i++) {
+      sizes.set(lump.readUInt32LE(aray + 8 + i * 8), lump.readUInt32LE(aray + 12 + i * 8));
+    }
+  }
+  return readNameChunk(lump, mexp).flatMap((name, index) => {
+    if (!name) return [];
+    const size = sizes.get(index);
+    return [size === undefined ? { name, index, isArray: false } : { name, index, isArray: true, size }];
+  });
 }

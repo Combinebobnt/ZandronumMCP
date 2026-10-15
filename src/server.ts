@@ -26,6 +26,8 @@ const config: ServerConfig = {
   iwad: process.env.ZANDRONUM_IWAD,
   acsSrc: process.env.ZANDRONUM_ACS_SRC,
   saveDir: process.env.ZANDRONUM_SAVE_DIR,
+  bcc: process.env.ZANDRONUM_BCC,
+  acc: process.env.ZANDRONUM_ACC,
 };
 
 const ctx = new ServerContext(config);

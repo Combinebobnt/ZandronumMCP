@@ -1,9 +1,18 @@
 import { describe, it, expect } from "vitest";
-import { parseBehaviorNames } from "../src/acs/bytecode.js";
+import { readFileSync } from "node:fs";
+import {
+  parseBehaviorNames,
+  parseMapExports,
+  isAcsObject,
+  hasAcsMagic,
+  parseLoadNames,
+  missingImports,
+} from "../src/acs/bytecode.js";
 import {
   buildBehaviorAcse,
   buildBehaviorAcs0Enhanced,
   buildBehaviorAcs0Plain,
+  buildBehaviorExports,
 } from "./fakes/acs-builder.js";
 
 describe("parseBehaviorNames", () => {
@@ -44,5 +53,68 @@ describe("parseBehaviorNames", () => {
   it("returns empty for non-ACS or too-short buffers", () => {
     expect(parseBehaviorNames(Buffer.from("PWAD"))).toEqual({ functions: [], namedScripts: [] });
     expect(parseBehaviorNames(Buffer.alloc(2))).toEqual({ functions: [], namedScripts: [] });
+  });
+});
+
+describe("parseMapExports", () => {
+  it("names each exported slot and sizes the ones ARAY marks as arrays", () => {
+    const lump = buildBehaviorExports(["credits", "", "round"], [{ index: 0, size: 17 }]);
+    expect(parseMapExports(lump)).toEqual([
+      { name: "credits", index: 0, isArray: true, size: 17 },
+      { name: "round", index: 2, isArray: false },
+    ]);
+  });
+
+  it("treats every export as a scalar when there is no ARAY chunk", () => {
+    expect(parseMapExports(buildBehaviorExports(["a"]))).toEqual([{ name: "a", index: 0, isArray: false }]);
+  });
+
+  it("returns empty without an MEXP chunk or chunked bytecode", () => {
+    expect(parseMapExports(buildBehaviorAcse(["f"], []))).toEqual([]);
+    expect(parseMapExports(buildBehaviorAcs0Plain())).toEqual([]);
+  });
+
+  it("reads only the ARAY pairs actually present when its size overstates them", () => {
+    const lump = buildBehaviorExports(["credits"], [{ index: 0, size: 17 }]);
+    lump.writeUInt32LE(0xffff, lump.indexOf("ARAY") + 4);
+    expect(parseMapExports(lump)).toEqual([{ name: "credits", index: 0, isArray: true, size: 17 }]);
+  });
+});
+
+describe("isAcsObject / parseLoadNames", () => {
+  // Real zt-bcc output: a #library snippet that #imports "mcplib".
+  const imp = readFileSync(new URL("./fixtures/runacs-import.o", import.meta.url));
+
+  it("reads a real object's LOAD chunk", () => {
+    expect(isAcsObject(imp)).toBe(true);
+    expect(parseLoadNames(imp)).toEqual(["mcplib"]);
+  });
+
+  it("finds no imports without a LOAD chunk or chunk region", () => {
+    expect(parseLoadNames(buildBehaviorAcse(["f"], []))).toEqual([]);
+    expect(parseLoadNames(buildBehaviorAcs0Plain())).toEqual([]);
+  });
+
+  it("rejects anything the engine's magic check would", () => {
+    expect(isAcsObject(Buffer.from("script 1 (void) {}  padding to 32 bytes"))).toBe(false);
+    expect(isAcsObject(Buffer.from("ACS"))).toBe(false);
+    const bad = Buffer.from(imp);
+    bad[3] = 0x58;
+    expect(isAcsObject(bad)).toBe(false);
+    expect(isAcsObject(buildBehaviorAcse([], []))).toBe(true);
+  });
+
+  it("knows the three magics, however short the rest is", () => {
+    for (const magic of ["ACS\0", "ACSE", "ACSe"]) expect(hasAcsMagic(Buffer.from(magic, "latin1"))).toBe(true);
+    expect(hasAcsMagic(Buffer.from("ACSX"))).toBe(false);
+    expect(hasAcsMagic(Buffer.from("ACS"))).toBe(false);
+  });
+});
+
+describe("missingImports", () => {
+  it("matches the first 8 characters, case-insensitively", () => {
+    expect(missingImports(["mcplib", "LongLibraryName"], ["MCPLIB", "LONGLIBR"])).toEqual([]);
+    expect(missingImports(["mcplib", "other"], ["MCPLIB"])).toEqual(["other"]);
+    expect(missingImports(["LongLibraryName"], ["LONGLIBRARYNAME"])).toEqual(["LongLibraryName"]);
   });
 });
