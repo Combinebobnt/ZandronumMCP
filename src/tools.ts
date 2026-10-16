@@ -6,7 +6,6 @@ import type { ServerContext } from "./context.js";
 import {
   parseStartupErrors,
   tailLines,
-  crashLogPath,
   readLogWindow,
   crashReportText,
 } from "./process/startuplog.js";
@@ -2174,9 +2173,8 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
       inputSchema: { instance: instanceArg },
     },
     async ({ instance }) => {
-      const logFile = ctx.logPathFor(instance);
-      const crashFile = logFile ? crashLogPath(logFile) : undefined;
-      if (!crashFile || !ctx.io.existsSync(crashFile)) {
+      const crash = ctx.readCrash(instance);
+      if (!crash) {
         return {
           content: [
             {
@@ -2188,10 +2186,10 @@ export function registerTools(server: McpServer, ctx: ServerContext): void {
       }
       const text = crashReportText({
         instance,
-        crashFile,
-        report: ctx.io.readTextSync(crashFile),
+        crashFile: crash.file,
+        report: crash.report,
         enginePid: ctx.enginePidFor(instance),
-        written: ctx.io.mtimeOf(crashFile),
+        written: crash.written,
       });
       return { content: [{ type: "text", text }] };
     },

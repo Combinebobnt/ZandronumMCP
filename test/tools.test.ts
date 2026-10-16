@@ -1513,17 +1513,14 @@ describe("diagnostic tools", () => {
   const crashFile = path.join("/engine", "mcp-bridge-7777.log.crash");
   const crashReport = (pid: number) =>
     `=== MCP ENGINE CRASH ===\nsignal: 11 SIGSEGV\npid: ${pid}\n\nbacktrace:\n#0 R_DrawColumn`;
+  const mtimeOnly = (file: string) => (p: string) => {
+    if (p !== file) throw new Error(`unexpected mtimeOf ${p} in test`);
+    return written;
+  };
   const crashed = (pid: number) =>
     offline(
       { exe: "/engine/zandronum" },
-      {
-        existsSync: () => true,
-        readTextSync: () => crashReport(pid),
-        mtimeOf: (p) => {
-          if (p !== crashFile) throw new Error(`unexpected mtimeOf ${p} in test`);
-          return written;
-        },
-      },
+      { existsSync: () => true, readTextSync: () => crashReport(pid), mtimeOf: mtimeOnly(crashFile) },
     );
 
   it("returns the report verbatim when its pid matches this instance's engine", async () => {
@@ -1549,7 +1546,7 @@ describe("diagnostic tools", () => {
       io: {
         existsSync: () => true,
         readTextSync: () => crashReport(4242),
-        mtimeOf: () => written,
+        mtimeOf: mtimeOnly(path.join("/engine", `mcp-bridge-${bridge.port}.log.crash`)),
         launchIo: {
           spawn: () => ({ pid: undefined, kill: () => {} }),
           waitForPort: () =>
